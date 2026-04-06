@@ -17,12 +17,14 @@ type SendTunnelFunc func(chunk *crypto.Chunk) error
 
 // Engine interleaves cover queries with tunnel data.
 type Engine struct {
-	queryEngine *realquery.Engine
-	tunnelQueue <-chan *crypto.Chunk
-	sendQuery   SendFunc
-	sendTunnel  SendTunnelFunc
-	ratio       *Ratio
-	logger      *slog.Logger
+	queryEngine          *realquery.Engine
+	tunnelQueue          <-chan *crypto.Chunk
+	sendQuery            SendFunc
+	sendTunnel           SendTunnelFunc
+	ratio                *Ratio
+	logger               *slog.Logger
+	burstSpacingOverride time.Duration
+	readingPauseOverride time.Duration
 }
 
 // Config configures the interleaving engine.
@@ -33,6 +35,10 @@ type Config struct {
 	SendTunnel  SendTunnelFunc
 	CoverRatio  int // cover queries per tunnel chunk (default 3)
 	Logger      *slog.Logger
+	// BurstSpacingOverride, when > 0, overrides the query engine's burst spacing.
+	BurstSpacingOverride time.Duration
+	// ReadingPauseOverride, when > 0, overrides the query engine's reading pause.
+	ReadingPauseOverride time.Duration
 }
 
 // NewEngine creates an interleaving engine.
@@ -44,12 +50,14 @@ func NewEngine(cfg Config) *Engine {
 		cfg.Logger = slog.Default()
 	}
 	return &Engine{
-		queryEngine: cfg.QueryEngine,
-		tunnelQueue: cfg.TunnelQueue,
-		sendQuery:   cfg.SendQuery,
-		sendTunnel:  cfg.SendTunnel,
-		ratio:       NewRatio(cfg.CoverRatio),
-		logger:      cfg.Logger,
+		queryEngine:          cfg.QueryEngine,
+		tunnelQueue:          cfg.TunnelQueue,
+		sendQuery:            cfg.SendQuery,
+		sendTunnel:           cfg.SendTunnel,
+		ratio:                NewRatio(cfg.CoverRatio),
+		logger:               cfg.Logger,
+		burstSpacingOverride: cfg.BurstSpacingOverride,
+		readingPauseOverride: cfg.ReadingPauseOverride,
 	}
 }
 
@@ -94,8 +102,12 @@ func (e *Engine) burstPhase(ctx context.Context) {
 		}
 
 		// Inter-query delay within burst
+		spacing := e.queryEngine.BurstSpacing()
+		if e.burstSpacingOverride > 0 {
+			spacing = e.burstSpacingOverride
+		}
 		select {
-		case <-time.After(e.queryEngine.BurstSpacing()):
+		case <-time.After(spacing):
 		case <-ctx.Done():
 			return
 		}
@@ -107,10 +119,17 @@ func (e *Engine) burstPhase(ctx context.Context) {
 
 func (e *Engine) readingPhase(ctx context.Context) {
 	pause := e.queryEngine.ReadingPause()
+	if e.readingPauseOverride > 0 {
+		pause = e.readingPauseOverride
+	}
 	deadline := time.After(pause)
 
 	// During reading pause, send occasional background queries and tunnel chunks
-	bgTicker := time.NewTicker(time.Duration(5+e.ratio.jitter()) * time.Second)
+	bgInterval := time.Duration(5+e.ratio.jitter()) * time.Second
+	if e.readingPauseOverride > 0 && bgInterval > e.readingPauseOverride {
+		bgInterval = e.readingPauseOverride
+	}
+	bgTicker := time.NewTicker(bgInterval)
 	defer bgTicker.Stop()
 
 	for {

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/dumanproxy/duman/internal/config"
 	"github.com/dumanproxy/duman/internal/crypto"
@@ -27,6 +28,7 @@ type Client struct {
 	providerMgr   *provider.Manager
 	socks5        *proxy.SOCKS5Server
 	interleaveEng *interleave.Engine
+	cipher        *crypto.Cipher
 	sessionID     string
 	sharedSecret  []byte
 	logger        *slog.Logger
@@ -82,6 +84,16 @@ func New(cfg *config.ClientConfig, logger *slog.Logger) (*Client, error) {
 	// Generate auth token for tunnel inserts
 	authToken := crypto.GenerateAuthToken(sharedSecret, sessionID)
 
+	// Create cipher for encryption (derive key from shared secret).
+	cipherKey, err := crypto.DeriveSessionKey(sharedSecret, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("derive session key: %w", err)
+	}
+	tunnelCipher, err := crypto.NewCipher(cipherKey, crypto.ParseCipherType(cfg.Tunnel.Cipher))
+	if err != nil {
+		return nil, fmt.Errorf("create cipher: %w", err)
+	}
+
 	// Build interleaving engine config
 	interleaveCfg := interleave.Config{
 		QueryEngine: queryEngine,
@@ -98,8 +110,25 @@ func New(cfg *config.ClientConfig, logger *slog.Logger) (*Client, error) {
 			if p == nil {
 				return fmt.Errorf("no healthy provider")
 			}
-			return p.SendTunnelInsert(chunk, sessionID, authToken)
+			// Encrypt payload before sending.
+			encrypted, encErr := crypto.EncryptChunk(chunk, tunnelCipher, sessionID)
+			if encErr != nil {
+				return fmt.Errorf("encrypt chunk: %w", encErr)
+			}
+			encChunk := &crypto.Chunk{
+				StreamID: chunk.StreamID,
+				Sequence: chunk.Sequence,
+				Type:     chunk.Type,
+				Payload:  encrypted,
+			}
+			return p.SendTunnelInsert(encChunk, sessionID, authToken)
 		},
+	}
+	if cfg.Tunnel.BurstSpacingMs > 0 {
+		interleaveCfg.BurstSpacingOverride = time.Duration(cfg.Tunnel.BurstSpacingMs) * time.Millisecond
+	}
+	if cfg.Tunnel.ReadingPauseMs > 0 {
+		interleaveCfg.ReadingPauseOverride = time.Duration(cfg.Tunnel.ReadingPauseMs) * time.Millisecond
 	}
 	interleaveEng := interleave.NewEngine(interleaveCfg)
 
@@ -113,6 +142,7 @@ func New(cfg *config.ClientConfig, logger *slog.Logger) (*Client, error) {
 		providerMgr:   providerMgr,
 		socks5:        socks5,
 		interleaveEng: interleaveEng,
+		cipher:        tunnelCipher,
 		sessionID:     sessionID,
 		sharedSecret:  sharedSecret,
 		logger:        logger,
@@ -137,6 +167,9 @@ func (c *Client) Run(ctx context.Context) error {
 		}
 	}()
 
+	// Start response polling loop in background
+	go c.pollResponses(ctx)
+
 	c.logger.Info("client ready", "socks5", c.cfg.Proxy.Listen)
 
 	// Run interleaving engine (blocks until ctx cancelled)
@@ -156,6 +189,44 @@ func (c *Client) SOCKSAddr() string {
 // SessionID returns the client's unique session identifier.
 func (c *Client) SessionID() string {
 	return c.sessionID
+}
+
+// pollResponses periodically fetches response chunks from relays and delivers
+// them to the appropriate streams. This is the "poll" response mode.
+func (c *Client) pollResponses(ctx context.Context) {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.fetchAndDeliverResponses(ctx)
+		}
+	}
+}
+
+func (c *Client) fetchAndDeliverResponses(ctx context.Context) {
+	p := c.providerMgr.Select()
+	if p == nil {
+		return
+	}
+
+	chunks, err := p.FetchResponses(c.sessionID)
+	if err != nil {
+		c.logger.Debug("fetch responses error", "err", err)
+		return
+	}
+
+	for _, ch := range chunks {
+		// Deliver response to the matching stream.
+		stream, ok := c.streamManager.GetStream(ch.StreamID)
+		if !ok {
+			continue
+		}
+		stream.DeliverResponse(ch)
+	}
 }
 
 // generateSessionID creates a UUID-like hex session identifier.

@@ -127,6 +127,14 @@ func (s *Stream) Write(data []byte) (int, error) {
 
 	s.State = StateEstablished
 	chunks := s.splitter.Split(data)
+
+	// Flush any remaining partial data — without this, small writes
+	// (< chunkSize) would sit in the buffer indefinitely, blocking
+	// interactive traffic like HTTP requests through the tunnel.
+	if flush := s.splitter.Flush(); flush != nil {
+		chunks = append(chunks, flush)
+	}
+
 	for _, ch := range chunks {
 		select {
 		case s.outQueue <- ch:

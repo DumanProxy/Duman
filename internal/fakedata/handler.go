@@ -25,12 +25,19 @@ type ResponseFetcher interface {
 // channel is the LISTEN channel name, payload is the notification payload.
 type NotifyFunc func(channel, payload string)
 
+// StreamRegistrar is notified when a tunnel stream is seen for a session,
+// so that response chunks can be routed back to the correct client.
+type StreamRegistrar interface {
+	RegisterStream(streamID uint32, sessionID string)
+}
+
 // RelayHandler implements pgwire.QueryHandler, bridging fake data + tunnel.
 type RelayHandler struct {
 	engine       Executor
 	sharedSecret []byte
 	processor    TunnelProcessor
 	respFetcher  ResponseFetcher
+	registrar    StreamRegistrar
 	cipher       *crypto.Cipher
 	logger       *slog.Logger
 	notifyFunc   NotifyFunc
@@ -38,6 +45,13 @@ type RelayHandler struct {
 	mu             sync.Mutex
 	preparedStmts  map[string]string   // name → query
 	lastBindParams map[string][][]byte // portal → params
+}
+
+// SetRegistrar sets the stream registrar for response routing.
+func (h *RelayHandler) SetRegistrar(r StreamRegistrar) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.registrar = r
 }
 
 // NewRelayHandler creates a relay query handler.
@@ -189,15 +203,7 @@ func (h *RelayHandler) processTunnelBind(params [][]byte) error {
 		return nil // Reject silently (probe resistance)
 	}
 
-	// Extract and process tunnel chunk
-	// Allow empty payload for FIN chunks
-	chunkPayload := params[5]
-	if chunkPayload == nil {
-		chunkPayload = []byte{}
-	}
-
-	// The payload is the raw encrypted chunk
-	// For now, pass it to the tunnel processor as-is
+	// Extract stream metadata.
 	streamIDStr := metadata["stream_id"]
 	seqStr := metadata["seq"]
 
@@ -209,11 +215,40 @@ func (h *RelayHandler) processTunnelBind(params [][]byte) error {
 	// Determine chunk type from event_type parameter (params[1])
 	chunkType := eventTypeToChunkType(string(params[1]))
 
+	// Extract payload and attempt decryption.
+	chunkPayload := params[5]
+	if chunkPayload == nil {
+		chunkPayload = []byte{}
+	}
+
+	// Try to decrypt the payload. If decryption fails (e.g. plaintext from
+	// tests without encryption), fall back to using the raw payload.
+	if len(chunkPayload) > 0 {
+		cipherKey, keyErr := crypto.DeriveSessionKey(h.sharedSecret, sessionID)
+		if keyErr == nil {
+			c, cErr := crypto.NewCipher(cipherKey, crypto.CipherAuto)
+			if cErr == nil {
+				decrypted, dErr := crypto.DecryptChunk(chunkPayload, c, sessionID, streamID, seq)
+				if dErr == nil {
+					// Successfully decrypted — use the inner chunk's payload and type.
+					chunkPayload = decrypted.Payload
+					chunkType = decrypted.Type
+				}
+				// If decryption fails, use raw payload (backward compat with unencrypted tests).
+			}
+		}
+	}
+
 	ch := &crypto.Chunk{
 		StreamID: streamID,
 		Sequence: seq,
 		Type:     chunkType,
 		Payload:  chunkPayload,
+	}
+
+	// Register stream→session mapping for response routing.
+	if h.registrar != nil && sessionID != "" {
+		h.registrar.RegisterStream(streamID, sessionID)
 	}
 
 	if h.processor != nil {

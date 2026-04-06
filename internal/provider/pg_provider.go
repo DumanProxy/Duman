@@ -193,9 +193,15 @@ func (p *PgProvider) FetchResponses(sessionID string) ([]*crypto.Chunk, error) {
 		if err != nil {
 			payload = row[0]
 		}
+		var seq uint64
+		var streamID uint32
+		fmt.Sscanf(string(row[1]), "%d", &seq)
+		fmt.Sscanf(string(row[2]), "%d", &streamID)
 		ch := &crypto.Chunk{
-			Type:    crypto.ChunkData,
-			Payload: payload,
+			Type:     crypto.ChunkData,
+			Payload:  payload,
+			Sequence: seq,
+			StreamID: streamID,
 		}
 		chunks = append(chunks, ch)
 	}

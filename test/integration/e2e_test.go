@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dumanproxy/duman/internal/client"
 	"github.com/dumanproxy/duman/internal/config"
 	"github.com/dumanproxy/duman/internal/crypto"
 	"github.com/dumanproxy/duman/internal/pgwire"
@@ -599,5 +600,322 @@ func sendTunnelChunk(t *testing.T, client *pgwire.Client, chunk *crypto.Chunk, s
 	}
 }
 
-// Ensure io import is used (for future tests with SOCKS5 proxy direct testing)
-var _ = io.EOF
+// TestE2E_BidirectionalTunnel is the ultimate proof-of-life test.
+// It verifies encrypted data flows: client → relay → destination → relay → client.
+func TestE2E_BidirectionalTunnel(t *testing.T) {
+	// 1. Start an echo TCP server (destination).
+	echoListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echoListener.Close()
+	destAddr := echoListener.Addr().String()
+
+	go func() {
+		for {
+			conn, err := echoListener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 4096)
+				for {
+					n, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+					// Echo back with "ECHO:" prefix
+					resp := append([]byte("ECHO:"), buf[:n]...)
+					c.Write(resp)
+				}
+			}(conn)
+		}
+	}()
+
+	// 2. Start relay
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	r := startRelay(t, ctx)
+
+	// 3. Connect as pgwire client
+	sharedSecret := []byte("test-secret-32-bytes!!!!!!!!!!!")
+	sessionID := "e2e-bidir-session"
+	authToken := crypto.GenerateAuthToken(sharedSecret, sessionID)
+
+	// Derive encryption key (same as the client would)
+	cipherKey, err := crypto.DeriveSessionKey(sharedSecret, sessionID)
+	if err != nil {
+		t.Fatalf("derive key: %v", err)
+	}
+	tunnelCipher, err := crypto.NewCipher(cipherKey, crypto.CipherAuto)
+	if err != nil {
+		t.Fatalf("create cipher: %v", err)
+	}
+
+	client, err := pgwire.Connect(ctx, pgwire.ClientConfig{
+		Address:  r.Addr(),
+		Username: "sensor_writer",
+		Password: "test_password",
+		Database: "analytics",
+	})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer client.Close()
+
+	err = client.Prepare("tunnel_insert",
+		"INSERT INTO analytics_events (session_id, event_type, page_url, user_agent, metadata, payload) VALUES ($1, $2, $3, $4, $5, $6)")
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	// 4. Send encrypted CONNECT chunk
+	sendEncryptedChunk(t, client, tunnelCipher, &crypto.Chunk{
+		StreamID: 1, Sequence: 0, Type: crypto.ChunkConnect,
+		Payload: []byte(destAddr),
+	}, sessionID, authToken)
+
+	time.Sleep(200 * time.Millisecond) // let connection establish
+
+	// 5. Send encrypted DATA chunk
+	testData := []byte("Hello, Duman tunnel!")
+	sendEncryptedChunk(t, client, tunnelCipher, &crypto.Chunk{
+		StreamID: 1, Sequence: 1, Type: crypto.ChunkData,
+		Payload: testData,
+	}, sessionID, authToken)
+
+	// 6. Poll for response — the echo server should send back "ECHO:Hello, Duman tunnel!"
+	var gotResponse bool
+	for attempt := 0; attempt < 30; attempt++ {
+		time.Sleep(100 * time.Millisecond)
+
+		result, err := client.SimpleQuery(
+			fmt.Sprintf("SELECT payload, seq, stream_id FROM analytics_responses WHERE session_id = '%s'", sessionID))
+		if err != nil {
+			t.Fatalf("poll: %v", err)
+		}
+
+		if len(result.Rows) > 0 {
+			// Got response data!
+			for _, row := range result.Rows {
+				if len(row) > 0 && row[0] != nil {
+					payload := row[0]
+					t.Logf("response payload: %q", payload)
+					if strings.Contains(string(payload), "ECHO:") {
+						gotResponse = true
+						break
+					}
+				}
+			}
+			if gotResponse {
+				break
+			}
+		}
+	}
+
+	if !gotResponse {
+		t.Fatal("never received echo response through the tunnel — bidirectional flow is broken")
+	}
+
+	t.Log("SUCCESS: bidirectional tunnel flow verified (client → relay → destination → relay → client)")
+
+	// 7. Clean up — send FIN
+	sendEncryptedChunk(t, client, tunnelCipher, &crypto.Chunk{
+		StreamID: 1, Sequence: 2, Type: crypto.ChunkFIN,
+	}, sessionID, authToken)
+}
+
+// TestE2E_FullClientRoundtrip starts the actual Client with SOCKS5 proxy,
+// connects through it to a destination, and verifies HTTP response.
+func TestE2E_FullClientRoundtrip(t *testing.T) {
+	// 1. Start mock HTTP server (destination)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(200)
+		w.Write([]byte("pong-from-destination"))
+	})
+	destListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	destSrv := &http.Server{Handler: mux}
+	go destSrv.Serve(destListener)
+	defer destSrv.Close()
+	destAddr := destListener.Addr().String()
+
+	// 2. Start relay with debug logging
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	relayCfg := &config.RelayConfig{}
+	relayCfg.Listen.PostgreSQL = "127.0.0.1:0"
+	relayCfg.Auth.Users = map[string]string{"sensor_writer": "test_password"}
+	relayCfg.Tunnel.SharedSecret = "dGVzdC1zZWNyZXQtMzItYnl0ZXMhISEhISEhISEhISE=" // same as client
+	relayCfg.FakeData.Scenario = "ecommerce"
+	relayCfg.FakeData.Seed = 42
+	relayCfg.Exit.MaxIdleSecs = 300
+
+	r, err := relay.New(relayCfg, nil)
+	if err != nil {
+		t.Fatalf("relay.New: %v", err)
+	}
+	go r.Run(ctx)
+	for i := 0; i < 50; i++ {
+		if r.Addr() != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if r.Addr() == "" {
+		t.Fatal("relay did not start")
+	}
+
+	// 3. Start client with debug logging
+	clientCfg := &config.ClientConfig{
+		Proxy: config.ProxyConfig{Listen: "127.0.0.1:0"},
+		Tunnel: config.TunnelConfig{
+			SharedSecret:   "dGVzdC1zZWNyZXQtMzItYnl0ZXMhISEhISEhISEhISE=", // base64 of "test-secret-32-bytes!!!!!!!!!!!"
+			ChunkSize:      16384,
+			Cipher:         "auto",
+			ResponseMode:   "poll",
+			BurstSpacingMs: 1,   // fast mode for testing
+			ReadingPauseMs: 10,  // 10ms instead of 2-30s
+		},
+		Scenario: "ecommerce",
+		Relays: []config.RelayEntry{
+			{Address: r.Addr(), Username: "sensor_writer", Password: "test_password", Database: "analytics", Weight: 10},
+		},
+	}
+
+	c, err := client.New(clientCfg, nil)
+	if err != nil {
+		t.Fatalf("client.New: %v", err)
+	}
+
+	runCtx, runCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer runCancel()
+
+	go c.Run(runCtx)
+
+	// Wait for SOCKS5 to start
+	var socksAddr string
+	for i := 0; i < 50; i++ {
+		socksAddr = c.SOCKSAddr()
+		if socksAddr != "" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if socksAddr == "" {
+		t.Fatal("SOCKS5 proxy did not start")
+	}
+
+	t.Logf("SOCKS5 proxy listening on %s", socksAddr)
+	t.Logf("Destination at %s", destAddr)
+
+	// 4. Connect through SOCKS5 proxy to the destination
+	// Manually perform SOCKS5 handshake
+	conn, err := net.DialTimeout("tcp", socksAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial SOCKS5: %v", err)
+	}
+	defer conn.Close()
+
+	// SOCKS5 greeting: version=5, 1 method, no auth
+	conn.Write([]byte{0x05, 0x01, 0x00})
+
+	// Read greeting response
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		t.Fatalf("socks5 greeting: %v", err)
+	}
+	if resp[0] != 0x05 || resp[1] != 0x00 {
+		t.Fatalf("socks5 greeting: unexpected %x", resp)
+	}
+
+	// SOCKS5 CONNECT request
+	host, portStr, _ := net.SplitHostPort(destAddr)
+	port := 0
+	fmt.Sscanf(portStr, "%d", &port)
+	connectReq := []byte{
+		0x05, 0x01, 0x00, // VER, CMD=CONNECT, RSV
+		0x01,                          // ATYP=IPv4
+		127, 0, 0, 1,                  // DST.ADDR
+		byte(port >> 8), byte(port),   // DST.PORT
+	}
+	_ = host
+	conn.Write(connectReq)
+
+	// Read CONNECT response
+	connResp := make([]byte, 10)
+	if _, err := io.ReadFull(conn, connResp); err != nil {
+		t.Fatalf("socks5 connect response: %v", err)
+	}
+	if connResp[1] != 0x00 {
+		t.Fatalf("socks5 connect failed: status=%d", connResp[1])
+	}
+
+	// 5. Send HTTP request through the tunnel
+	httpReq := fmt.Sprintf("GET /ping HTTP/1.0\r\nHost: %s\r\n\r\n", destAddr)
+	conn.Write([]byte(httpReq))
+
+	// 6. Read HTTP response
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	respBuf := make([]byte, 4096)
+	n, err := conn.Read(respBuf)
+	if err != nil && err != io.EOF {
+		t.Fatalf("read HTTP response: %v", err)
+	}
+
+	httpResp := string(respBuf[:n])
+	t.Logf("HTTP response:\n%s", httpResp)
+
+	if !strings.Contains(httpResp, "pong-from-destination") {
+		t.Fatal("did not receive expected HTTP response through SOCKS5 → tunnel → destination → tunnel → SOCKS5")
+	}
+
+	t.Log("SUCCESS: Full client roundtrip verified (SOCKS5 → tunnel → HTTP destination → tunnel → SOCKS5)")
+}
+
+// sendEncryptedChunk encrypts a chunk and sends it via prepared INSERT.
+func sendEncryptedChunk(t *testing.T, client *pgwire.Client, c *crypto.Cipher, chunk *crypto.Chunk, sessionID, authToken string) {
+	t.Helper()
+
+	// Encrypt the full chunk
+	encrypted, err := crypto.EncryptChunk(chunk, c, sessionID)
+	if err != nil {
+		t.Fatalf("encrypt chunk: %v", err)
+	}
+
+	metadata := fmt.Sprintf(`{"pixel_id":"%s","stream_id":"%d","seq":"%d"}`,
+		authToken, chunk.StreamID, chunk.Sequence)
+
+	var eventType string
+	switch chunk.Type {
+	case crypto.ChunkConnect:
+		eventType = "session_start"
+	case crypto.ChunkData:
+		eventType = "conversion_pixel"
+	case crypto.ChunkFIN:
+		eventType = "session_end"
+	default:
+		eventType = "custom_event"
+	}
+
+	params := [][]byte{
+		[]byte(sessionID),
+		[]byte(eventType),
+		[]byte("/analytics"),
+		[]byte("Mozilla/5.0"),
+		[]byte(metadata),
+		encrypted, // encrypted payload
+	}
+
+	err = client.PreparedInsert("tunnel_insert", params)
+	if err != nil {
+		t.Fatalf("sendEncryptedChunk: %v", err)
+	}
+}

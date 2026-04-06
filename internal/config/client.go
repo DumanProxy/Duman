@@ -37,6 +37,12 @@ type TunnelConfig struct {
 	PFS          bool   `yaml:"pfs"`
 	Padding      bool   `yaml:"padding"`
 	JitterMs     int    `yaml:"jitter_ms"`
+	Role         string `yaml:"role"`       // relay role: relay, exit, both
+	ForwardTo    string `yaml:"forward_to"` // next relay address for relay role
+	// BurstSpacingMs overrides the interleave engine's burst spacing (test use).
+	BurstSpacingMs int `yaml:"burst_spacing_ms,omitempty"`
+	// ReadingPauseMs overrides the interleave engine's reading pause (test use).
+	ReadingPauseMs int `yaml:"reading_pause_ms,omitempty"`
 }
 
 type RelayEntry struct {

@@ -16,14 +16,15 @@ import (
 // Relay orchestrates the pgwire server, fake-data engine, tunnel exit engine,
 // and relay handler into a single runnable unit.
 type Relay struct {
-	cfg        *config.RelayConfig
-	server     *pgwire.Server
-	fakeEngine fakedata.Executor
-	exitEngine *tunnel.ExitEngine
-	handler    *fakedata.RelayHandler
-	forwarder  *Forwarder     // non-nil when role=relay
+	cfg         *config.RelayConfig
+	server      *pgwire.Server
+	fakeEngine  fakedata.Executor
+	exitEngine  *tunnel.ExitEngine
+	respBridge  *tunnel.ResponseBridge
+	handler     *fakedata.RelayHandler
+	forwarder   *Forwarder     // non-nil when role=relay
 	fwdListener *ForwardListener // non-nil when role=exit|both
-	logger     *slog.Logger
+	logger      *slog.Logger
 }
 
 // New creates a Relay from the given configuration.
@@ -65,8 +66,21 @@ func New(cfg *config.RelayConfig, logger *slog.Logger) (*Relay, error) {
 		processor = &exitProcessor{engine: exitEngine}
 	}
 
-	// Create relay handler (respFetcher is nil — responses go through polling).
-	handler := fakedata.NewRelayHandler(fakeEngine, sharedSecret, processor, nil, logger)
+	// Create response bridge for exit/both roles.
+	var respBridge *tunnel.ResponseBridge
+	if exitEngine != nil {
+		respBridge = tunnel.NewResponseBridge(logger)
+	}
+
+	// Create relay handler with response bridge as the fetcher.
+	var respFetcher fakedata.ResponseFetcher
+	if respBridge != nil {
+		respFetcher = respBridge
+	}
+	handler := fakedata.NewRelayHandler(fakeEngine, sharedSecret, processor, respFetcher, logger)
+	if respBridge != nil {
+		handler.SetRegistrar(respBridge)
+	}
 
 	// Build MD5 auth.
 	auth := &pgwire.MD5Auth{
@@ -89,6 +103,7 @@ func New(cfg *config.RelayConfig, logger *slog.Logger) (*Relay, error) {
 		server:     server,
 		fakeEngine: fakeEngine,
 		exitEngine: exitEngine,
+		respBridge: respBridge,
 		handler:    handler,
 		forwarder:  forwarder,
 		logger:     logger,
@@ -125,6 +140,11 @@ func (r *Relay) Run(ctx context.Context) error {
 				return r.exitEngine.ProcessChunk(ctx, ch)
 			}, r.logger)
 		}
+	}
+
+	// Start response bridge to drain exit engine responses.
+	if r.respBridge != nil && r.exitEngine != nil {
+		go r.respBridge.Run(ctx, r.exitEngine.RespQueue())
 	}
 
 	r.logger.Info("relay starting",
