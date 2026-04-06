@@ -75,24 +75,20 @@ jobs:
       - name: Build all platforms
         run: |
           mkdir -p dist
-          platforms=(
-            "linux/amd64"
-            "linux/arm64"
-            "darwin/amd64"
-            "darwin/arm64"
-            "windows/amd64"
-          )
-          for platform in "${platforms[@]}"; do
-            IFS='/' read -r GOOS GOARCH <<< "$platform"
-            ext=""
-            if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
-
-            echo "Building $GOOS/$GOARCH..."
-            GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w" \
-              -o "dist/duman-client-${GOOS}-${GOARCH}${ext}" ./cmd/duman-client/
-            GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w" \
-              -o "dist/duman-relay-${GOOS}-${GOARCH}${ext}" ./cmd/duman-relay/
-          done
+          build() {
+            local os=$1 arch=$2 ext=""
+            if [ "$os" = "windows" ]; then ext=".exe"; fi
+            echo "Building $os/$arch..."
+            GOOS=$os GOARCH=$arch go build -ldflags="-s -w" \
+              -o "dist/duman-client-${os}-${arch}${ext}" ./cmd/duman-client/
+            GOOS=$os GOARCH=$arch go build -ldflags="-s -w" \
+              -o "dist/duman-relay-${os}-${arch}${ext}" ./cmd/duman-relay/
+          }
+          build linux amd64
+          build linux arm64
+          build darwin amd64
+          build darwin arm64
+          build windows amd64
 
       - name: Copy config examples
         run: |
