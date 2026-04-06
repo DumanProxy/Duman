@@ -116,10 +116,11 @@ type ServerConfig struct {
 
 // Server accepts PostgreSQL wire protocol connections.
 type Server struct {
-	config   ServerConfig
-	listener net.Listener
-	wg       sync.WaitGroup
-	logger   *slog.Logger
+	config     ServerConfig
+	listenerMu sync.Mutex
+	listener   net.Listener
+	wg         sync.WaitGroup
+	logger     *slog.Logger
 }
 
 // NewServer creates a new PgWire server.
@@ -143,7 +144,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
+	s.listenerMu.Lock()
 	s.listener = ln
+	s.listenerMu.Unlock()
 
 	s.logger.Info("PostgreSQL server listening", "addr", s.config.ListenAddr)
 
@@ -175,10 +178,13 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 
 // Addr returns the listener address (useful for tests with port 0).
 func (s *Server) Addr() net.Addr {
-	if s.listener == nil {
+	s.listenerMu.Lock()
+	ln := s.listener
+	s.listenerMu.Unlock()
+	if ln == nil {
 		return nil
 	}
-	return s.listener.Addr()
+	return ln.Addr()
 }
 
 // Broker returns the server's notification broker (may be nil if push mode is disabled).
