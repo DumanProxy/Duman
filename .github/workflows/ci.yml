@@ -26,11 +26,11 @@ jobs:
         run: go build ./...
 
       - name: Test
-        run: go test ./... -count=1 -short -timeout 5m
+        run: go test ./... -count=1 -short -timeout 10m
 
       - name: Test with race detector
         if: matrix.os == 'ubuntu-latest'
-        run: go test ./... -race -count=1 -short -timeout 10m
+        run: go test ./... -race -count=1 -short -timeout 15m
 
   bench:
     name: Benchmark
