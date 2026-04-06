@@ -4,8 +4,8 @@
 *.dll
 *.so
 *.dylib
-duman-client
-duman-relay
+/duman-client
+/duman-relay
 /dist/
 
 # Test binary
