@@ -145,6 +145,80 @@ func TestNew_MultipleRelays(t *testing.T) {
 	}
 }
 
+func TestBuildQueryEngine_Template(t *testing.T) {
+	cfg := &config.ClientConfig{
+		Scenario:  "ecommerce",
+		SchemaCfg: config.SchemaConfig{Mode: "template", Seed: 42},
+	}
+	eng, err := buildQueryEngine(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eng == nil {
+		t.Fatal("expected non-nil engine")
+	}
+}
+
+func TestBuildQueryEngine_TemplateMutate(t *testing.T) {
+	cfg := &config.ClientConfig{
+		Scenario:  "ecommerce",
+		SchemaCfg: config.SchemaConfig{Mode: "template", Seed: 42, Mutate: true},
+	}
+	eng, err := buildQueryEngine(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eng == nil {
+		t.Fatal("expected non-nil engine")
+	}
+}
+
+func TestBuildQueryEngine_Random(t *testing.T) {
+	cfg := &config.ClientConfig{
+		Scenario:  "ecommerce",
+		SchemaCfg: config.SchemaConfig{Mode: "random", Seed: 99},
+	}
+	eng, err := buildQueryEngine(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eng == nil {
+		t.Fatal("expected non-nil engine")
+	}
+}
+
+func TestBuildQueryEngine_Custom(t *testing.T) {
+	cfg := &config.ClientConfig{
+		Scenario: "ecommerce",
+		SchemaCfg: config.SchemaConfig{
+			Mode:      "custom",
+			Seed:      1,
+			CustomDDL: "CREATE TABLE patients (id SERIAL PRIMARY KEY, name VARCHAR(255));",
+		},
+	}
+	eng, err := buildQueryEngine(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eng == nil {
+		t.Fatal("expected non-nil engine")
+	}
+}
+
+func TestBuildQueryEngine_DefaultMode(t *testing.T) {
+	cfg := &config.ClientConfig{
+		Scenario:  "iot",
+		SchemaCfg: config.SchemaConfig{Mode: "", Seed: 0},
+	}
+	eng, err := buildQueryEngine(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eng == nil {
+		t.Fatal("expected non-nil engine")
+	}
+}
+
 func TestClient_Run(t *testing.T) {
 	// Start a relay
 	relayCfg := &config.RelayConfig{}

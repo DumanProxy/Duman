@@ -1,6 +1,9 @@
 package service
 
-import "testing"
+import (
+	"runtime"
+	"testing"
+)
 
 // mockService is a minimal Service implementation for testing.
 type mockService struct {
@@ -81,5 +84,42 @@ func TestServiceInterface(t *testing.T) {
 
 	if svc.IsRunning() {
 		t.Error("IsRunning() = true after Stop, want false")
+	}
+}
+
+// TestInstall_NonWindows verifies Install returns an error on non-Windows.
+func TestInstall_NonWindows(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows — Install talks to SCM")
+	}
+	err := Install(Config{Name: "test"})
+	if err == nil {
+		t.Fatal("expected error on non-Windows platform")
+	}
+}
+
+// TestUninstall_NonWindows verifies Uninstall returns an error on non-Windows.
+func TestUninstall_NonWindows(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows — Uninstall talks to SCM")
+	}
+	err := Uninstall("test")
+	if err == nil {
+		t.Fatal("expected error on non-Windows platform")
+	}
+}
+
+// TestRunAsService_NonWindows verifies RunAsService returns false on non-Windows.
+func TestRunAsService_NonWindows(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping on Windows — RunAsService talks to SCM")
+	}
+	svc := &mockService{name: "test"}
+	ran, err := RunAsService(svc)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ran {
+		t.Fatal("expected ran=false on non-Windows platform")
 	}
 }
