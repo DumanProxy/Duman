@@ -1,33 +1,33 @@
 # Duman Quick Start — Demo Setup
 
-**Linux sunucuda relay, Windows'ta client. 5 dakikada çalışır.**
+**Relay on a Linux server, client on Windows. Up and running in 5 minutes.**
 
 ---
 
-## 1. Shared Secret Oluştur (herhangi bir makinede)
+## 1. Generate a Shared Secret
 
 ```bash
-# Go kuruluysa:
+# With Go installed:
 go run ./cmd/duman-client keygen
 
-# Veya OpenSSL ile:
+# Or with OpenSSL:
 openssl rand -base64 32
 ```
 
-Çıkan değeri kaydet — hem server hem client'a lazım.
+Save the output — both the server and client need the same value.
 
 ---
 
-## 2. Linux Sunucu — Relay Kurulumu
+## 2. Linux Server — Relay Setup
 
-### Otomatik (önerilen)
+### Automated (recommended)
 
 ```bash
-# Binary'yi sunucuya kopyala
-scp dist/duman-relay-linux-amd64 user@sunucu:/tmp/
+# Copy binary to the server
+scp dist/duman-relay-linux-amd64 user@server:/tmp/
 
-# SSH ile bağlan ve kur
-ssh user@sunucu
+# SSH in and install
+ssh user@server
 sudo bash -c '
   cp /tmp/duman-relay-linux-amd64 /usr/local/bin/duman-relay
   chmod +x /usr/local/bin/duman-relay
@@ -35,16 +35,18 @@ sudo bash -c '
 '
 ```
 
-### Ya da install script ile:
+### Or use the install script:
 
 ```bash
-# Repo'yu sunucuya klonla veya script'i kopyala
+# Clone the repo on the server or copy the script over
 sudo bash scripts/install-relay.sh --from-local /tmp/duman-relay-linux-amd64
 ```
 
-### Manuel Config
+The script creates a systemd service, generates secrets, configures the firewall, and prints the shared secret + password you need for the client.
 
-`/etc/duman/relay.yaml` (veya çalışma dizininde `duman-relay.yaml`):
+### Manual Config
+
+Create `/etc/duman/relay.yaml` (or `duman-relay.yaml` in the working directory):
 
 ```yaml
 listen:
@@ -53,10 +55,10 @@ listen:
 auth:
   method: "md5"
   users:
-    sensor_writer: "BURAYA_GUCLU_SIFRE"
+    sensor_writer: "YOUR_STRONG_PASSWORD"
 
 tunnel:
-  shared_secret: "BURAYA_SHARED_SECRET"
+  shared_secret: "YOUR_SHARED_SECRET"
   role: "exit"
 
 fake_data:
@@ -74,13 +76,13 @@ log:
   output: "stderr"
 ```
 
-### Başlat
+### Start
 
 ```bash
-# Foreground (test için):
+# Foreground (for testing):
 duman-relay -c /etc/duman/relay.yaml -v
 
-# Systemd ile (install script kullandıysan):
+# With systemd (if you used the install script):
 sudo systemctl start duman-relay
 sudo systemctl status duman-relay
 sudo journalctl -u duman-relay -f
@@ -90,31 +92,31 @@ sudo journalctl -u duman-relay -f
 
 ```bash
 sudo ufw allow 5432/tcp   # UFW
-# veya
+# or
 sudo iptables -A INPUT -p tcp --dport 5432 -j ACCEPT
 ```
 
 ---
 
-## 3. Windows Client — Kurulum
+## 3. Windows Client — Setup
 
-### Binary'yi indir/kopyala
+### Download / copy the binary
 
-`dist/duman-client-windows-amd64.exe` dosyasını istediğin yere koy.
+Place `dist/duman-client-windows-amd64.exe` wherever you like.
 
-### PowerShell ile kurulum:
+### Install with PowerShell:
 
 ```powershell
-# Admin PowerShell aç, repo dizinine git
+# Open an admin PowerShell, navigate to the repo
 .\scripts\install-client.ps1 `
-  -RelayAddress "SUNUCU_IP:5432" `
-  -SharedSecret "BURAYA_SHARED_SECRET" `
-  -Password "BURAYA_GUCLU_SIFRE"
+  -RelayAddress "SERVER_IP:5432" `
+  -SharedSecret "YOUR_SHARED_SECRET" `
+  -Password "YOUR_STRONG_PASSWORD"
 ```
 
-### Manuel Config
+### Manual Config
 
-`%APPDATA%\Duman\client.yaml` oluştur:
+Create `%APPDATA%\Duman\client.yaml`:
 
 ```yaml
 proxy:
@@ -122,18 +124,18 @@ proxy:
   mode: "socks5"
 
 tunnel:
-  shared_secret: "BURAYA_SHARED_SECRET"
+  shared_secret: "YOUR_SHARED_SECRET"
   chunk_size: 16384
   response_mode: "poll"
   cipher: "auto"
 
 relays:
-  - address: "SUNUCU_IP:5432"
+  - address: "SERVER_IP:5432"
     protocol: "postgresql"
     weight: 10
     database: "analytics"
     username: "sensor_writer"
-    password: "BURAYA_GUCLU_SIFRE"
+    password: "YOUR_STRONG_PASSWORD"
 
 scenario: "ecommerce"
 
@@ -148,13 +150,13 @@ log:
   output: "stderr"
 ```
 
-### Başlat
+### Start
 
 ```cmd
 duman-client.exe -c %APPDATA%\Duman\client.yaml -v
 ```
 
-Çıktıda şunu görmen lazım:
+You should see:
 ```
 INFO  client ready  socks5=127.0.0.1:1080
 INFO  SOCKS5 proxy listening  addr=127.0.0.1:1080
@@ -162,49 +164,48 @@ INFO  SOCKS5 proxy listening  addr=127.0.0.1:1080
 
 ---
 
-## 4. Test Et
+## 4. Verify
 
-### curl ile (SOCKS5 proxy üzerinden):
+### With curl (through the SOCKS5 proxy):
 
 ```bash
 # Linux/Mac:
 curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
 
-# Windows (Git Bash veya WSL):
+# Windows (Git Bash or WSL):
 curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
-
-# PowerShell:
-# SOCKS5 doğrudan desteklenmiyor, browser kullan
 ```
 
-### Browser ile:
+The output should be the **server's IP**, not your local IP.
+
+### With a browser:
 
 **Firefox:**
 1. Settings → Network Settings → Manual proxy
 2. SOCKS Host: `127.0.0.1`, Port: `1080`
-3. SOCKS v5 seç
-4. "Proxy DNS when using SOCKS v5" işaretle
-5. https://ifconfig.me → sunucunun IP'si gelmeli
+3. Select SOCKS v5
+4. Check "Proxy DNS when using SOCKS v5"
+5. Visit https://ifconfig.me — should show the relay server's IP
 
-**Chrome (komut satırı):**
+**Chrome (command line):**
 ```
 chrome.exe --proxy-server="socks5://127.0.0.1:1080"
 ```
 
 ---
 
-## 5. Sorun Giderme
+## 5. Troubleshooting
 
-| Sorun | Çözüm |
-|-------|-------|
-| `config error: proxy.listen is required` | Config dosyası bulunamıyor. `-c` ile yol ver |
-| `connect relays: dial tcp: connection refused` | Sunucuda relay çalışıyor mu? Port açık mı? |
-| `invalid tunnel auth token` | shared_secret eşleşmiyor — iki tarafta aynı olmalı |
-| `auth failed` | username/password eşleşmiyor |
-| SOCKS5'e bağlanılamıyor | Client çalışıyor mu? `127.0.0.1:1080` dinliyor mu? |
-| Yanıt gelmiyor | Relay'de `exit.max_idle_secs` kontrol et |
+| Problem | Solution |
+|---------|----------|
+| `config error: proxy.listen is required` | Config file not found. Pass the path with `-c` |
+| `connect relays: dial tcp: connection refused` | Is the relay running on the server? Is the port open? |
+| `invalid tunnel auth token` | `shared_secret` mismatch — must be identical on both sides |
+| `auth failed` | username/password mismatch between client and relay config |
+| Cannot connect to SOCKS5 | Is the client running? Is it listening on `127.0.0.1:1080`? |
+| No response data | Check `exit.max_idle_secs` on the relay |
 
-### Debug modu:
+### Debug mode:
 
 ```bash
 # Relay:
@@ -216,16 +217,16 @@ duman-client -c client.yaml -v
 
 ---
 
-## Mimari
+## Architecture
 
 ```
-[Windows]                           [Linux Sunucu]                    [Internet]
-                                                    
-  Browser ──→ SOCKS5 ──→ duman-client ──→ PostgreSQL wire ──→ duman-relay ──→ Hedef site
-  (1080)     Tunnel chunks hidden          (5432)            Exit engine
-             inside INSERT/SELECT                            dials target
-             statements                                      
+[Windows]                           [Linux Server]                    [Internet]
+
+  Browser --> SOCKS5 --> duman-client --> PostgreSQL wire --> duman-relay --> Target
+  (1080)     Tunnel chunks hidden         (5432)            Exit engine
+             inside INSERT/SELECT                           dials target
+             statements
 ```
 
-Trafik, gerçek bir PostgreSQL analytics veritabanı gibi görünür.
-DPI sistemleri INSERT INTO analytics_events ... görür — şifreli tunnel verisini değil.
+Traffic looks like a real PostgreSQL analytics database.
+DPI systems see `INSERT INTO analytics_events ...` — not encrypted tunnel data.
