@@ -1,0 +1,57 @@
+[Unit]
+Description=Duman Relay - Steganographic Database Tunnel
+Documentation=https://github.com/dumanproxy/duman
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=duman
+Group=duman
+
+ExecStart=/usr/local/bin/duman-relay -c /etc/duman/duman-relay.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=always
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+# File descriptors
+LimitNOFILE=65535
+LimitNPROC=4096
+
+# Working directory
+WorkingDirectory=/var/lib/duman
+
+# Environment
+Environment=DUMAN_LOG_LEVEL=info
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/duman
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+# Allow binding to privileged ports (< 1024)
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=duman-relay
+
+[Install]
+WantedBy=multi-user.target

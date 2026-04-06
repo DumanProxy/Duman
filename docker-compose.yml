@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile.relay
+    container_name: duman-relay
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+      - "3306:3306"
+      - "443:443"
+      - "9091:9091"
+    volumes:
+      - ./configs/duman-relay.yaml:/etc/duman/duman-relay.yaml:ro
+    command: ["-c", "/etc/duman/duman-relay.yaml"]
+    environment:
+      - DUMAN_LOG_LEVEL=info
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: duman-client
+    restart: unless-stopped
+    ports:
+      - "1080:1080"
+    volumes:
+      - ./configs/duman-client.yaml:/etc/duman/duman-client.yaml:ro
+    command: ["-c", "/etc/duman/duman-client.yaml"]
+    depends_on:
+      - relay
+    environment:
+      - DUMAN_LOG_LEVEL=info

@@ -87,6 +87,48 @@ func BenchmarkAES256GCM_Decrypt_16KB(b *testing.B) {
 	}
 }
 
+// BenchmarkChaCha20_Encrypt_1KB benchmarks ChaCha20-Poly1305 encryption of 1KB payload.
+func BenchmarkChaCha20_Encrypt_1KB(b *testing.B) {
+	key := make([]byte, KeySize)
+	rand.Read(key)
+	c, err := NewCipher(key, CipherChaCha20)
+	if err != nil {
+		b.Fatal(err)
+	}
+	plaintext := make([]byte, 1024)
+	rand.Read(plaintext)
+	aad := []byte("bench-aad-data")
+	dst := make([]byte, 0, len(plaintext)+TagSize)
+
+	b.SetBytes(int64(len(plaintext)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		dst = dst[:0]
+		c.Seal(dst, plaintext, aad, uint64(i))
+	}
+}
+
+// BenchmarkAES256GCM_Encrypt_1KB benchmarks AES-256-GCM encryption of 1KB payload.
+func BenchmarkAES256GCM_Encrypt_1KB(b *testing.B) {
+	key := make([]byte, KeySize)
+	rand.Read(key)
+	c, err := NewCipher(key, CipherAES256GCM)
+	if err != nil {
+		b.Fatal(err)
+	}
+	plaintext := make([]byte, 1024)
+	rand.Read(plaintext)
+	aad := []byte("bench-aad-data")
+	dst := make([]byte, 0, len(plaintext)+TagSize)
+
+	b.SetBytes(int64(len(plaintext)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		dst = dst[:0]
+		c.Seal(dst, plaintext, aad, uint64(i))
+	}
+}
+
 // BenchmarkHKDF_DeriveSessionKey benchmarks session key derivation.
 func BenchmarkHKDF_DeriveSessionKey(b *testing.B) {
 	secret := make([]byte, 32)
