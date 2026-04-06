@@ -1,0 +1,84 @@
+# Duman Client Configuration
+# Copy to duman-client.yaml and customize
+
+# Local proxy settings
+proxy:
+  listen: "127.0.0.1:1080"    # SOCKS5 proxy address
+  mode: "socks5"               # socks5 or tun
+  kill_switch: false            # Block tunneled traffic if all relays fail
+
+# Tunnel encryption settings
+tunnel:
+  shared_secret: ""            # Base64 shared secret (generate with: duman-client keygen)
+  chunk_size: 16384            # Chunk size in bytes (16KB default)
+  response_mode: "poll"        # poll or push (LISTEN/NOTIFY)
+  cipher: "auto"               # auto, chacha20, aes256gcm
+  pfs: false                   # Perfect forward secrecy (X25519 ephemeral)
+  padding: false               # Pad all chunks to chunk_size
+  jitter_ms: 0                 # Random delay per chunk (0 = disabled)
+
+# Relay servers
+relays:
+  - address: "db.example.com:5432"
+    protocol: "postgresql"
+    weight: 10
+    database: "telemetry"
+    username: "sensor_writer"
+    password: "your_password"
+  # - address: "db2.example.com:3306"
+  #   protocol: "mysql"
+  #   weight: 5
+  #   database: "analytics"
+  #   username: "writer"
+  #   password: "your_password"
+  # - address: "api.example.com:443"
+  #   protocol: "rest"
+  #   weight: 5
+
+# Application scenario for cover queries
+scenario: "ecommerce"          # ecommerce, iot, saas, blog, project
+
+# Schema configuration (overrides scenario when mode != template)
+schema:
+  mode: "template"             # template, random, custom
+  mutate: false                # Randomize table/column names for uniqueness
+  seed: 42                     # Seed for deterministic schema generation
+  # custom_ddl: |              # Provide your own SQL DDL (mode: custom)
+  #   CREATE TABLE users (id SERIAL PRIMARY KEY, name VARCHAR(255));
+  #   CREATE TABLE posts (id SERIAL PRIMARY KEY, user_id INT REFERENCES users(id));
+
+# Noise layer settings
+noise:
+  phantom_browser:
+    enabled: false
+    region: "global"           # turkey, europe, global
+  smoke_screen:
+    enabled: false
+    peer_count: 5
+    profiles: ["video_call", "messaging"]
+  decoy:
+    enabled: false
+    targets: ["github.com", "stackoverflow.com"]
+    count: 3
+
+# Relay pool settings
+pool:
+  max_active: 3
+  health_check_seconds: 30
+
+# Traffic routing (for TUN mode)
+routing:
+  mode: "socks5"
+  rules:
+    - match: "10.0.0.0/8"
+      action: "direct"
+    - match: "192.168.0.0/16"
+      action: "direct"
+    - match: "*"
+      action: "tunnel"
+
+# Logging
+log:
+  level: "info"                # debug, info, warn, error
+  format: "text"               # text, json
+  output: "stderr"             # stderr, stdout, or file path

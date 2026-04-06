@@ -1,0 +1,49 @@
+# Duman Relay Configuration
+# Copy to duman-relay.yaml and customize
+
+# Listen addresses (leave empty to disable protocol)
+listen:
+  postgresql: ":5432"
+  # mysql: ":3306"
+  # rest: ":443"
+
+# TLS configuration
+tls:
+  mode: "self_signed"          # acme, manual, self_signed
+  # cert_file: "/path/to/cert.pem"   # for manual mode
+  # key_file: "/path/to/key.pem"     # for manual mode
+  # domain: "db.example.com"          # for ACME mode
+
+# Authentication
+auth:
+  method: "md5"                # md5, scram-sha-256
+  users:
+    sensor_writer: "your_password"
+
+# Tunnel settings
+tunnel:
+  shared_secret: ""            # Base64 shared secret (must match client)
+  max_streams: 1000
+  role: "exit"                 # exit, relay, both
+  # forward_to: "next-relay:5432"  # for relay mode
+
+# Fake data engine
+fake_data:
+  scenario: "ecommerce"       # ecommerce, iot, saas, blog, project
+  seed: 42                     # Deterministic seed for reproducible data
+  mode: "template"             # template, random, custom
+  mutate: false                # Randomize table/column names for uniqueness
+  # custom_ddl: |              # Provide your own SQL DDL (mode: custom)
+  #   CREATE TABLE users (id SERIAL PRIMARY KEY, name VARCHAR(255));
+  #   CREATE TABLE posts (id SERIAL PRIMARY KEY, user_id INT REFERENCES users(id));
+
+# Exit engine
+exit:
+  max_conns: 1000
+  max_idle_secs: 300
+
+# Logging
+log:
+  level: "info"
+  format: "text"
+  output: "stderr"
