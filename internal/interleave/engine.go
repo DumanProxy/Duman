@@ -113,8 +113,12 @@ func (e *Engine) burstPhase(ctx context.Context) {
 		}
 	}
 
-	// Drain remaining tunnel chunks at end of burst
-	e.drainTunnelChunks(ctx, 3)
+	// Drain remaining tunnel chunks at end of burst.
+	// When the queue has data waiting, flush aggressively.
+	pending := len(e.tunnelQueue)
+	if pending > 0 {
+		e.drainTunnelChunks(ctx, pending+1)
+	}
 }
 
 func (e *Engine) readingPhase(ctx context.Context) {
@@ -142,8 +146,13 @@ func (e *Engine) readingPhase(ctx context.Context) {
 			// Background analytics write
 			e.sendQuery(e.queryEngine.RandomAnalyticsEvent())
 
-			// Inject tunnel chunk if available
-			e.injectTunnelChunk(ctx)
+			// Drain all pending tunnel chunks
+			pending := len(e.tunnelQueue)
+			if pending > 0 {
+				e.drainTunnelChunks(ctx, pending)
+			} else {
+				e.injectTunnelChunk(ctx)
+			}
 		}
 	}
 }
