@@ -55,6 +55,9 @@ func New(cfg *config.ClientConfig, logger *slog.Logger) (*Client, error) {
 	sharedSecret, err := base64.StdEncoding.DecodeString(cfg.Tunnel.SharedSecret)
 	if err != nil {
 		sharedSecret = []byte(cfg.Tunnel.SharedSecret)
+		logger.Info("shared secret loaded (raw)", "len", len(sharedSecret))
+	} else {
+		logger.Info("shared secret loaded (base64)", "len", len(sharedSecret))
 	}
 
 	// Generate session ID

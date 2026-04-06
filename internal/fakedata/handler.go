@@ -199,7 +199,10 @@ func (h *RelayHandler) processTunnelBind(params [][]byte) error {
 	}
 
 	if !crypto.VerifyAuthToken(pixelID, h.sharedSecret, sessionID) {
-		h.logger.Debug("invalid tunnel auth token")
+		h.logger.Debug("invalid tunnel auth token",
+			"session", sessionID,
+			"secret_len", len(h.sharedSecret),
+			"token_prefix", pixelID[:min(10, len(pixelID))])
 		return nil // Reject silently (probe resistance)
 	}
 
