@@ -73,6 +73,11 @@ func (e *Engine) Run(ctx context.Context) error {
 		// Burst phase: send cover queries, inject tunnel chunks
 		e.burstPhase(ctx)
 
+		// Skip reading pause when tunnel data is waiting — prioritize throughput.
+		if len(e.tunnelQueue) > 0 {
+			continue
+		}
+
 		// Reading phase: pause with background writes
 		e.readingPhase(ctx)
 	}
@@ -95,21 +100,29 @@ func (e *Engine) burstPhase(ctx context.Context) {
 		}
 		coverSent++
 
-		// After N cover queries, inject tunnel chunk if available
-		if coverSent >= e.ratio.Current() {
+		// Inject tunnel chunks. When the queue is loaded, send after every
+		// cover query (1:1 ratio) for maximum throughput. Otherwise use the
+		// configured cover ratio.
+		injectThreshold := e.ratio.Current()
+		if len(e.tunnelQueue) > 0 {
+			injectThreshold = 1
+		}
+		if coverSent >= injectThreshold {
 			e.injectTunnelChunk(ctx)
 			coverSent = 0
 		}
 
-		// Inter-query delay within burst
-		spacing := e.queryEngine.BurstSpacing()
-		if e.burstSpacingOverride > 0 {
-			spacing = e.burstSpacingOverride
-		}
-		select {
-		case <-time.After(spacing):
-		case <-ctx.Done():
-			return
+		// Inter-query delay within burst (skip when queue has data)
+		if len(e.tunnelQueue) == 0 {
+			spacing := e.queryEngine.BurstSpacing()
+			if e.burstSpacingOverride > 0 {
+				spacing = e.burstSpacingOverride
+			}
+			select {
+			case <-time.After(spacing):
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
 
@@ -142,17 +155,16 @@ func (e *Engine) readingPhase(ctx context.Context) {
 			return
 		case <-deadline:
 			return
+		case chunk := <-e.tunnelQueue:
+			// Tunnel data arrived — send immediately and return to burst phase.
+			if err := e.sendTunnel(chunk); err != nil {
+				e.logger.Debug("tunnel send failed", "err", err)
+			}
+			e.drainTunnelChunks(ctx, len(e.tunnelQueue)+1)
+			return
 		case <-bgTicker.C:
 			// Background analytics write
 			e.sendQuery(e.queryEngine.RandomAnalyticsEvent())
-
-			// Drain all pending tunnel chunks
-			pending := len(e.tunnelQueue)
-			if pending > 0 {
-				e.drainTunnelChunks(ctx, pending)
-			} else {
-				e.injectTunnelChunk(ctx)
-			}
 		}
 	}
 }
