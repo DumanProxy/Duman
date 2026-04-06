@@ -1184,11 +1184,12 @@ func TestTUNEngine_IPv6_Direct(t *testing.T) {
 }
 
 func TestTUNEngine_Run_ReadErrorAfterCancel(t *testing.T) {
-	// Test the path where Read returns an error after context is already cancelled.
-	dev := &errorAfterCancelTUNDevice{
-		name:    "test0",
-		mtu:     1500,
-		readBuf: make(chan []byte, 10),
+	// Test the path where ctx is cancelled while Read blocks, then Read returns error.
+	// The Run loop should detect ctx.Done and return ctx.Err.
+	dev := &delayedErrorTUNDevice{
+		name:   "test0",
+		mtu:    1500,
+		errCh:  make(chan struct{}),
 	}
 	streams := newControllableStreamCreator()
 	router := NewRouter(nil, ActionDirect)
@@ -1209,17 +1210,12 @@ func TestTUNEngine_Run_ReadErrorAfterCancel(t *testing.T) {
 		errCh <- engine.Run(ctx)
 	}()
 
-	// Send a packet, then cancel, then the device returns an error
-	pkt := buildIPv4Packet(ipProtoTCP, net.ParseIP("10.0.0.1").To4(),
-		net.ParseIP("8.8.8.8").To4(), 12345, 80, nil)
-	dev.readBuf <- pkt
+	// Let the engine start and block on Read
 	time.Sleep(50 * time.Millisecond)
 
+	// Cancel context first, then unblock Read with an error
 	cancel()
-	// Signal device to return error
-	dev.mu.Lock()
-	dev.cancelled = true
-	dev.mu.Unlock()
+	close(dev.errCh)
 
 	select {
 	case err := <-errCh:
@@ -1231,34 +1227,20 @@ func TestTUNEngine_Run_ReadErrorAfterCancel(t *testing.T) {
 	}
 }
 
-type errorAfterCancelTUNDevice struct {
-	name      string
-	mtu       int
-	readBuf   chan []byte
-	cancelled bool
-	mu        sync.Mutex
+type delayedErrorTUNDevice struct {
+	name  string
+	mtu   int
+	errCh chan struct{}
 }
 
-func (d *errorAfterCancelTUNDevice) Name() string { return d.name }
-func (d *errorAfterCancelTUNDevice) MTU() int     { return d.mtu }
-func (d *errorAfterCancelTUNDevice) Read(buf []byte) (int, error) {
-	d.mu.Lock()
-	c := d.cancelled
-	d.mu.Unlock()
-	if c {
-		return 0, errors.New("device closed")
-	}
-	pkt, ok := <-d.readBuf
-	if !ok {
-		return 0, io.EOF
-	}
-	return copy(buf, pkt), nil
+func (d *delayedErrorTUNDevice) Name() string { return d.name }
+func (d *delayedErrorTUNDevice) MTU() int     { return d.mtu }
+func (d *delayedErrorTUNDevice) Read(buf []byte) (int, error) {
+	<-d.errCh // block until signalled
+	return 0, errors.New("device closed")
 }
-func (d *errorAfterCancelTUNDevice) Write(buf []byte) (int, error) { return len(buf), nil }
-func (d *errorAfterCancelTUNDevice) Close() error {
-	close(d.readBuf)
-	return nil
-}
+func (d *delayedErrorTUNDevice) Write(buf []byte) (int, error) { return len(buf), nil }
+func (d *delayedErrorTUNDevice) Close() error                  { return nil }
 
 func TestTUNEngine_IPv6_Block(t *testing.T) {
 	dev := newMockTUNDevice("test0", 1500)
