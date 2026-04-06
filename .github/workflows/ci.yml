@@ -30,6 +30,7 @@ jobs:
         run: go build ./...
 
       - name: Test
+        shell: bash
         run: |
           go test $(go list ./... | grep -v '/proxy$' | grep -v '/benchmark$') \
             -count=1 -short -timeout 10m
