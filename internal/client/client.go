@@ -84,9 +84,6 @@ func New(cfg *config.ClientConfig, logger *slog.Logger) (*Client, error) {
 		return nil, fmt.Errorf("build query engine: %w", err)
 	}
 
-	// Generate auth token for tunnel inserts
-	authToken := crypto.GenerateAuthToken(sharedSecret, sessionID)
-
 	// Create cipher for encryption (derive key from shared secret).
 	cipherKey, err := crypto.DeriveSessionKey(sharedSecret, sessionID)
 	if err != nil {
@@ -124,7 +121,7 @@ func New(cfg *config.ClientConfig, logger *slog.Logger) (*Client, error) {
 				Type:     chunk.Type,
 				Payload:  encrypted,
 			}
-			return p.SendTunnelInsert(encChunk, sessionID, authToken)
+			return p.SendTunnelInsert(encChunk, sessionID, crypto.GenerateAuthToken(sharedSecret, sessionID))
 		},
 	}
 	if cfg.Tunnel.BurstSpacingMs > 0 {
