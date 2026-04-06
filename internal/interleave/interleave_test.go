@@ -176,6 +176,8 @@ func TestEngine_Run_CancelsOnContext(t *testing.T) {
 	}, func(ch *crypto.Chunk) error {
 		return nil
 	})
+	e.burstSpacingOverride = 1 * time.Millisecond
+	e.readingPauseOverride = 1 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -192,7 +194,218 @@ func TestEngine_Run_CancelsOnContext(t *testing.T) {
 	mu.Unlock()
 }
 
-func TestEngine_BurstPhase(t *testing.T) {
+// --- pumpData tests ---
+
+func TestEngine_PumpData_SendsFirstChunk(t *testing.T) {
+	tunnelQueue := make(chan *crypto.Chunk, 10)
+	chunk := makeChunk(1, 1)
+
+	var tunnelReceived []*crypto.Chunk
+
+	e := newTestEngine(tunnelQueue, func(q string) error {
+		return nil
+	}, func(ch *crypto.Chunk) error {
+		tunnelReceived = append(tunnelReceived, ch)
+		return nil
+	})
+
+	ctx := context.Background()
+	e.pumpData(ctx, chunk)
+
+	if len(tunnelReceived) == 0 {
+		t.Fatal("expected at least one tunnel chunk sent")
+	}
+	if tunnelReceived[0].StreamID != 1 {
+		t.Errorf("StreamID = %d, want 1", tunnelReceived[0].StreamID)
+	}
+	if tunnelReceived[0].Sequence != 1 {
+		t.Errorf("Sequence = %d, want 1", tunnelReceived[0].Sequence)
+	}
+}
+
+func TestEngine_PumpData_DrainsQueue(t *testing.T) {
+	tunnelQueue := make(chan *crypto.Chunk, 10)
+	for i := 1; i <= 5; i++ {
+		tunnelQueue <- makeChunk(uint32(i), uint64(i))
+	}
+	first := makeChunk(0, 0)
+
+	var mu sync.Mutex
+	var tunnelSent int
+
+	e := newTestEngine(tunnelQueue, func(q string) error {
+		return nil
+	}, func(ch *crypto.Chunk) error {
+		mu.Lock()
+		tunnelSent++
+		mu.Unlock()
+		return nil
+	})
+
+	ctx := context.Background()
+	e.pumpData(ctx, first)
+
+	mu.Lock()
+	defer mu.Unlock()
+	// 1 first + 5 from queue = 6
+	if tunnelSent != 6 {
+		t.Errorf("tunnel sent = %d, want 6", tunnelSent)
+	}
+	if len(tunnelQueue) != 0 {
+		t.Errorf("queue remaining = %d, want 0", len(tunnelQueue))
+	}
+}
+
+func TestEngine_PumpData_InterleavesCoverQueries(t *testing.T) {
+	tunnelQueue := make(chan *crypto.Chunk, 20)
+	// Put 8 chunks in queue (+ 1 first = 9 total)
+	for i := 0; i < 8; i++ {
+		tunnelQueue <- makeChunk(uint32(i+1), uint64(i+1))
+	}
+	first := makeChunk(0, 0)
+
+	var mu sync.Mutex
+	var coverQueries int
+
+	e := newTestEngine(tunnelQueue, func(q string) error {
+		mu.Lock()
+		coverQueries++
+		mu.Unlock()
+		return nil
+	}, func(ch *crypto.Chunk) error {
+		return nil
+	})
+
+	ctx := context.Background()
+	e.pumpData(ctx, first)
+
+	mu.Lock()
+	defer mu.Unlock()
+	// pumpData sends tunnel chunks at max speed, then exactly 1 cover query
+	// at the end after the queue is drained (no cover queries during pumping).
+	if coverQueries != 1 {
+		t.Errorf("cover queries = %d, want 1", coverQueries)
+	}
+}
+
+func TestEngine_PumpData_EmptyQueue(t *testing.T) {
+	// Queue is empty, only the first chunk gets sent
+	tunnelQueue := make(chan *crypto.Chunk, 10)
+	first := makeChunk(1, 1)
+
+	var mu sync.Mutex
+	var tunnelSent int
+	var coverQueries int
+
+	e := newTestEngine(tunnelQueue, func(q string) error {
+		mu.Lock()
+		coverQueries++
+		mu.Unlock()
+		return nil
+	}, func(ch *crypto.Chunk) error {
+		mu.Lock()
+		tunnelSent++
+		mu.Unlock()
+		return nil
+	})
+
+	ctx := context.Background()
+	e.pumpData(ctx, first)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if tunnelSent != 1 {
+		t.Errorf("tunnel sent = %d, want 1", tunnelSent)
+	}
+	// Final cover query on queue drain
+	if coverQueries != 1 {
+		t.Errorf("cover queries = %d, want 1 (final closure)", coverQueries)
+	}
+}
+
+func TestEngine_PumpData_CancelledContext(t *testing.T) {
+	tunnelQueue := make(chan *crypto.Chunk, 10)
+	for i := 0; i < 5; i++ {
+		tunnelQueue <- makeChunk(uint32(i), uint64(i))
+	}
+	first := makeChunk(99, 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var tunnelSent int
+
+	e := newTestEngine(tunnelQueue, func(q string) error {
+		return nil
+	}, func(ch *crypto.Chunk) error {
+		tunnelSent++
+		return nil
+	})
+
+	e.pumpData(ctx, first)
+
+	// First chunk is always sent (before the loop checks ctx)
+	if tunnelSent != 1 {
+		t.Errorf("tunnel sent = %d, want 1 (first chunk only)", tunnelSent)
+	}
+}
+
+func TestEngine_PumpData_SendError(t *testing.T) {
+	tunnelQueue := make(chan *crypto.Chunk, 10)
+	tunnelQueue <- makeChunk(2, 2)
+	first := makeChunk(1, 1)
+
+	var tunnelErrors int
+
+	e := newTestEngine(tunnelQueue, func(q string) error {
+		return nil
+	}, func(ch *crypto.Chunk) error {
+		tunnelErrors++
+		return fmt.Errorf("simulated tunnel error")
+	})
+
+	ctx := context.Background()
+	e.pumpData(ctx, first)
+
+	// Both chunks should be attempted despite errors
+	if tunnelErrors != 2 {
+		t.Errorf("tunnel errors = %d, want 2", tunnelErrors)
+	}
+}
+
+func TestEngine_PumpData_MultipleSendErrors(t *testing.T) {
+	tunnelQueue := make(chan *crypto.Chunk, 10)
+	tunnelQueue <- makeChunk(1, 1)
+	tunnelQueue <- makeChunk(2, 2)
+	tunnelQueue <- makeChunk(3, 3)
+	first := makeChunk(0, 0)
+
+	var mu sync.Mutex
+	var tunnelErrors int
+
+	e := newTestEngine(tunnelQueue, func(q string) error {
+		return nil
+	}, func(ch *crypto.Chunk) error {
+		mu.Lock()
+		tunnelErrors++
+		mu.Unlock()
+		return fmt.Errorf("simulated drain tunnel error")
+	})
+
+	ctx := context.Background()
+	e.pumpData(ctx, first)
+
+	mu.Lock()
+	defer mu.Unlock()
+	// first + 3 queued = 4 attempts
+	if tunnelErrors != 4 {
+		t.Errorf("tunnel errors = %d, want 4", tunnelErrors)
+	}
+}
+
+// --- idleCycle tests ---
+
+func TestEngine_IdleCycle_SendsCoverQueries(t *testing.T) {
 	tunnelQueue := make(chan *crypto.Chunk, 10)
 
 	var mu sync.Mutex
@@ -206,18 +419,19 @@ func TestEngine_BurstPhase(t *testing.T) {
 	}, func(ch *crypto.Chunk) error {
 		return nil
 	})
+	e.burstSpacingOverride = 1 * time.Millisecond
+	e.readingPauseOverride = 1 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	e.burstPhase(ctx)
+	e.idleCycle(ctx)
 
 	mu.Lock()
 	defer mu.Unlock()
 	if len(queries) == 0 {
-		t.Error("burstPhase should have sent at least one query")
+		t.Error("idleCycle should have sent at least one cover query")
 	}
-	// Verify queries are non-empty strings
 	for i, q := range queries {
 		if q == "" {
 			t.Errorf("query[%d] is empty", i)
@@ -225,7 +439,7 @@ func TestEngine_BurstPhase(t *testing.T) {
 	}
 }
 
-func TestEngine_BurstPhase_CancelMidBurst(t *testing.T) {
+func TestEngine_IdleCycle_CancelMidBurst(t *testing.T) {
 	tunnelQueue := make(chan *crypto.Chunk, 10)
 
 	var mu sync.Mutex
@@ -243,151 +457,157 @@ func TestEngine_BurstPhase_CancelMidBurst(t *testing.T) {
 	}, func(ch *crypto.Chunk) error {
 		return nil
 	})
+	e.burstSpacingOverride = 1 * time.Millisecond
+	e.readingPauseOverride = 1 * time.Millisecond
 
-	e.burstPhase(ctx)
+	e.idleCycle(ctx)
 
 	// Just verify it didn't panic and returned
 	mu.Lock()
 	defer mu.Unlock()
-	// queryCount could be 0 or more depending on timing - that's fine
 	t.Logf("queries sent before cancel: %d", queryCount)
 }
 
-func TestEngine_InjectTunnelChunk_WithData(t *testing.T) {
+func TestEngine_IdleCycle_PreCancelledContext(t *testing.T) {
 	tunnelQueue := make(chan *crypto.Chunk, 10)
-	chunk := makeChunk(1, 1)
-	tunnelQueue <- chunk
 
-	var tunnelReceived *crypto.Chunk
+	var queryCount int
 
 	e := newTestEngine(tunnelQueue, func(q string) error {
+		queryCount++
 		return nil
 	}, func(ch *crypto.Chunk) error {
-		tunnelReceived = ch
 		return nil
 	})
 
-	ctx := context.Background()
-	e.injectTunnelChunk(ctx)
-
-	if tunnelReceived == nil {
-		t.Fatal("expected SendTunnel to be called with a chunk")
-	}
-	if tunnelReceived.StreamID != 1 {
-		t.Errorf("StreamID = %d, want 1", tunnelReceived.StreamID)
-	}
-	if tunnelReceived.Sequence != 1 {
-		t.Errorf("Sequence = %d, want 1", tunnelReceived.Sequence)
-	}
-}
-
-func TestEngine_InjectTunnelChunk_NoPending(t *testing.T) {
-	tunnelQueue := make(chan *crypto.Chunk, 10)
-	// Queue is empty
-
-	var mu sync.Mutex
-	var coverQueries []string
-
-	e := newTestEngine(tunnelQueue, func(q string) error {
-		mu.Lock()
-		coverQueries = append(coverQueries, q)
-		mu.Unlock()
-		return nil
-	}, func(ch *crypto.Chunk) error {
-		t.Error("SendTunnel should not be called when queue is empty")
-		return nil
-	})
-
-	ctx := context.Background()
-	e.injectTunnelChunk(ctx)
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(coverQueries) != 1 {
-		t.Errorf("expected 1 cover analytics query, got %d", len(coverQueries))
-	}
-}
-
-func TestEngine_DrainTunnelChunks(t *testing.T) {
-	tunnelQueue := make(chan *crypto.Chunk, 10)
-
-	// Put 5 chunks in the queue
-	for i := 0; i < 5; i++ {
-		tunnelQueue <- makeChunk(uint32(i), uint64(i))
-	}
-
-	var mu sync.Mutex
-	var drained []*crypto.Chunk
-
-	e := newTestEngine(tunnelQueue, func(q string) error {
-		return nil
-	}, func(ch *crypto.Chunk) error {
-		mu.Lock()
-		drained = append(drained, ch)
-		mu.Unlock()
-		return nil
-	})
-
-	ctx := context.Background()
-	e.drainTunnelChunks(ctx, 3) // drain max 3
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(drained) != 3 {
-		t.Errorf("drained %d chunks, want 3", len(drained))
-	}
-
-	// 2 should remain in queue
-	if len(tunnelQueue) != 2 {
-		t.Errorf("remaining in queue = %d, want 2", len(tunnelQueue))
-	}
-}
-
-func TestEngine_DrainTunnelChunks_EmptyQueue(t *testing.T) {
-	tunnelQueue := make(chan *crypto.Chunk, 10)
-
-	var drainCount int
-	e := newTestEngine(tunnelQueue, func(q string) error {
-		return nil
-	}, func(ch *crypto.Chunk) error {
-		drainCount++
-		return nil
-	})
-
-	ctx := context.Background()
-	e.drainTunnelChunks(ctx, 3)
-
-	if drainCount != 0 {
-		t.Errorf("drained %d chunks from empty queue, want 0", drainCount)
-	}
-}
-
-func TestEngine_DrainTunnelChunks_CancelledContext(t *testing.T) {
-	// Use an unbuffered channel so there's nothing to read
-	tunnelQueue := make(chan *crypto.Chunk)
-
-	var drainCount int
-
-	// Pre-cancel the context before calling drain.
-	// With empty unbuffered queue, tunnelQueue is NOT ready.
-	// ctx.Done() IS ready. default runs only if no case is ready,
-	// but ctx.Done() is ready, so it will be selected.
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	cancel() // cancel before idleCycle
+
+	e.idleCycle(ctx)
+
+	// No queries should be sent because ctx is already done
+	if queryCount != 0 {
+		t.Errorf("queryCount = %d, want 0 with pre-cancelled context", queryCount)
+	}
+}
+
+func TestEngine_IdleCycle_CoverQueryError(t *testing.T) {
+	// Verify that a cover query error is logged but does not stop the cycle
+	tunnelQueue := make(chan *crypto.Chunk, 10)
+
+	var mu sync.Mutex
+	var callCount int
+
+	e := newTestEngine(tunnelQueue, func(q string) error {
+		mu.Lock()
+		callCount++
+		mu.Unlock()
+		return fmt.Errorf("query send error")
+	}, func(ch *crypto.Chunk) error {
+		return nil
+	})
+	e.burstSpacingOverride = 1 * time.Millisecond
+	e.readingPauseOverride = 1 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	e.idleCycle(ctx)
+
+	mu.Lock()
+	defer mu.Unlock()
+	// Even with errors, multiple queries should have been attempted
+	if callCount == 0 {
+		t.Error("expected at least one query attempt")
+	}
+}
+
+func TestEngine_IdleCycle_SwitchesToPumpOnTunnelData(t *testing.T) {
+	tunnelQueue := make(chan *crypto.Chunk, 10)
+
+	var mu sync.Mutex
+	var tunnelSent int
+	var querySent int
+
+	e := newTestEngine(tunnelQueue, func(q string) error {
+		mu.Lock()
+		querySent++
+		// After a couple queries, inject tunnel data
+		if querySent == 2 {
+			tunnelQueue <- makeChunk(1, 1)
+		}
+		mu.Unlock()
+		return nil
+	}, func(ch *crypto.Chunk) error {
+		mu.Lock()
+		tunnelSent++
+		mu.Unlock()
+		return nil
+	})
+	e.burstSpacingOverride = 1 * time.Millisecond
+	e.readingPauseOverride = 1 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	e.idleCycle(ctx)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if tunnelSent == 0 {
+		t.Error("expected tunnel chunks to be sent when data appeared mid-idle")
+	}
+}
+
+func TestEngine_IdleCycle_ReadingPauseCancels(t *testing.T) {
+	tunnelQueue := make(chan *crypto.Chunk, 10)
 
 	e := newTestEngine(tunnelQueue, func(q string) error {
 		return nil
 	}, func(ch *crypto.Chunk) error {
-		drainCount++
 		return nil
 	})
+	e.burstSpacingOverride = 1 * time.Millisecond
+	e.readingPauseOverride = 5 * time.Second // long pause
 
-	e.drainTunnelChunks(ctx, 5)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
 
-	if drainCount != 0 {
-		t.Errorf("drained %d chunks with cancelled context and empty queue, want 0", drainCount)
+	start := time.Now()
+	e.idleCycle(ctx)
+	elapsed := time.Since(start)
+
+	// Should return quickly when context is cancelled, not wait for 5s pause
+	if elapsed > 1*time.Second {
+		t.Errorf("idleCycle took %v, expected < 1s with cancelled context", elapsed)
 	}
 }
+
+func TestEngine_IdleCycle_ReadingPauseExpires(t *testing.T) {
+	tunnelQueue := make(chan *crypto.Chunk, 10)
+
+	e := newTestEngine(tunnelQueue, func(q string) error {
+		return nil
+	}, func(ch *crypto.Chunk) error {
+		return nil
+	})
+	e.burstSpacingOverride = 1 * time.Millisecond
+	e.readingPauseOverride = 20 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	e.idleCycle(ctx)
+	elapsed := time.Since(start)
+
+	// Should complete within ~200ms (burst + 20ms pause), not wait for 5s ctx timeout
+	if elapsed > 1*time.Second {
+		t.Errorf("idleCycle took %v, expected < 1s with 20ms reading pause", elapsed)
+	}
+}
+
+// --- Run-level tests ---
 
 func TestEngine_Run_SendsQueriesAndTunnelData(t *testing.T) {
 	tunnelQueue := make(chan *crypto.Chunk, 10)
@@ -412,6 +632,8 @@ func TestEngine_Run_SendsQueriesAndTunnelData(t *testing.T) {
 		mu.Unlock()
 		return nil
 	})
+	e.burstSpacingOverride = 1 * time.Millisecond
+	e.readingPauseOverride = 1 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
@@ -445,6 +667,8 @@ func TestEngine_SendError(t *testing.T) {
 	}, func(ch *crypto.Chunk) error {
 		return nil
 	})
+	e.burstSpacingOverride = 1 * time.Millisecond
+	e.readingPauseOverride = 1 * time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -458,77 +682,6 @@ func TestEngine_SendError(t *testing.T) {
 	defer mu.Unlock()
 	if queryErrors == 0 {
 		t.Error("expected some query send attempts that returned errors")
-	}
-}
-
-func TestEngine_TunnelSendError(t *testing.T) {
-	tunnelQueue := make(chan *crypto.Chunk, 10)
-	tunnelQueue <- makeChunk(1, 1)
-
-	var tunnelErrors int
-
-	e := newTestEngine(tunnelQueue, func(q string) error {
-		return nil
-	}, func(ch *crypto.Chunk) error {
-		tunnelErrors++
-		return fmt.Errorf("simulated tunnel error")
-	})
-
-	ctx := context.Background()
-	e.injectTunnelChunk(ctx)
-
-	if tunnelErrors != 1 {
-		t.Errorf("tunnel errors = %d, want 1", tunnelErrors)
-	}
-}
-
-func TestEngine_DrainTunnelChunks_SendError(t *testing.T) {
-	tunnelQueue := make(chan *crypto.Chunk, 10)
-	tunnelQueue <- makeChunk(1, 1)
-	tunnelQueue <- makeChunk(2, 2)
-
-	var mu sync.Mutex
-	var tunnelErrors int
-
-	e := newTestEngine(tunnelQueue, func(q string) error {
-		return nil
-	}, func(ch *crypto.Chunk) error {
-		mu.Lock()
-		tunnelErrors++
-		mu.Unlock()
-		return fmt.Errorf("simulated drain tunnel error")
-	})
-
-	ctx := context.Background()
-	e.drainTunnelChunks(ctx, 5)
-
-	mu.Lock()
-	defer mu.Unlock()
-	if tunnelErrors != 2 {
-		t.Errorf("tunnel errors = %d, want 2", tunnelErrors)
-	}
-}
-
-func TestEngine_ReadingPhase_CancelsOnContext(t *testing.T) {
-	tunnelQueue := make(chan *crypto.Chunk, 10)
-
-	e := newTestEngine(tunnelQueue, func(q string) error {
-		return nil
-	}, func(ch *crypto.Chunk) error {
-		return nil
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-	defer cancel()
-
-	start := time.Now()
-	e.readingPhase(ctx)
-	elapsed := time.Since(start)
-
-	// readingPhase should return quickly when context is cancelled,
-	// not wait for the full ReadingPause (2-30 seconds)
-	if elapsed > 1*time.Second {
-		t.Errorf("readingPhase took %v, expected < 1s with cancelled context", elapsed)
 	}
 }
 
@@ -567,112 +720,8 @@ func TestNewEngine_CustomCoverRatio(t *testing.T) {
 	}
 }
 
-func TestEngine_InjectTunnelChunk_UpdatesRatio(t *testing.T) {
-	// Use a large buffered queue to simulate queue depth
-	tunnelQueue := make(chan *crypto.Chunk, 200)
-	for i := 0; i < 150; i++ {
-		tunnelQueue <- makeChunk(uint32(i), uint64(i))
-	}
-
-	e := newTestEngine(tunnelQueue, func(q string) error {
-		return nil
-	}, func(ch *crypto.Chunk) error {
-		return nil
-	})
-
-	initialRatio := e.ratio.Current()
-
-	ctx := context.Background()
-	e.injectTunnelChunk(ctx)
-
-	// After injecting with ~149 remaining in queue (>100), ratio should decrease
-	newRatio := e.ratio.Current()
-	if newRatio >= initialRatio {
-		t.Errorf("ratio should decrease for high queue depth: initial=%d, after=%d", initialRatio, newRatio)
-	}
-}
-
-func TestEngine_BurstPhase_PreCancelledContext(t *testing.T) {
-	// Pre-cancel context so the ctx.Done() case at the top of the for-loop body fires
-	tunnelQueue := make(chan *crypto.Chunk, 10)
-
-	var queryCount int
-
-	e := newTestEngine(tunnelQueue, func(q string) error {
-		queryCount++
-		return nil
-	}, func(ch *crypto.Chunk) error {
-		return nil
-	})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel before burstPhase
-
-	e.burstPhase(ctx)
-
-	// No queries should be sent because ctx is already done
-	if queryCount != 0 {
-		t.Errorf("queryCount = %d, want 0 with pre-cancelled context", queryCount)
-	}
-}
-
-func TestEngine_ReadingPhase_DeadlineExpires(t *testing.T) {
-	// Test that readingPhase returns when the reading pause deadline expires.
-	// ReadingPause returns 2-30 seconds. We create an engine and call
-	// readingPhase directly, letting it run until the deadline fires.
-	// The bgTicker fires every 5+jitter(0-4) seconds = 5-9s.
-	// If ReadingPause returns a small value (2-4s), the deadline fires
-	// before the ticker, covering the deadline branch.
-	//
-	// We try multiple seeds to find one that gives a short ReadingPause
-	// after the rng state consumed by NextBurst (called in burstPhase).
-	if testing.Short() {
-		t.Skip("skipping slow test for readingPhase deadline")
-	}
-
-	// Use seed 100 - consume rng state via NextBurst first, then ReadingPause
-	// should give a short value for some seed.
-	qe := realquery.NewEngine("ecommerce", 100)
-	tunnelQueue := make(chan *crypto.Chunk, 10)
-
-	e := NewEngine(Config{
-		QueryEngine: qe,
-		TunnelQueue: tunnelQueue,
-		SendQuery:   func(q string) error { return nil },
-		SendTunnel:  func(ch *crypto.Chunk) error { return nil },
-	})
-
-	// Consume rng state by calling NextBurst (like burstPhase would)
-	qe.NextBurst()
-
-	// Now readingPhase will call ReadingPause which uses the rng.
-	// We give it a 35-second context so the deadline always fires before ctx.
-	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
-	defer cancel()
-
-	start := time.Now()
-	e.readingPhase(ctx)
-	elapsed := time.Since(start)
-
-	// Verify readingPhase returned (via deadline, not context)
-	if elapsed >= 35*time.Second {
-		t.Errorf("readingPhase took %v, expected it to return via deadline before ctx timeout", elapsed)
-	}
-}
-
-func TestEngine_ReadingPhase_BackgroundQueries(t *testing.T) {
-	// This test verifies the bgTicker.C branch in readingPhase by running
-	// the full Run loop long enough for the reading phase to send at least
-	// one background query via the ticker. The ticker interval is 5+jitter
-	// seconds (5-9s). So we need a context of ~6-10 seconds.
-	// That's too slow for a unit test, so we test via a shorter integration.
-	//
-	// Instead, we can test that readingPhase sends background queries
-	// by observing that Run() with enough time sends queries during the
-	// reading pause. But since readingPause is 2-30s, we need a moderate
-	// timeout.
-	//
-	// Practical alternative: Exercise the code through a longer Run.
+func TestEngine_Run_LongerDuration(t *testing.T) {
+	// Run engine long enough to exercise multiple idle cycles
 	if testing.Short() {
 		t.Skip("skipping slow integration test")
 	}
@@ -696,7 +745,7 @@ func TestEngine_ReadingPhase_BackgroundQueries(t *testing.T) {
 		return nil
 	})
 
-	// Run for 8 seconds - enough for a burst + reading phase with bg ticker
+	// Run for 8 seconds - enough for multiple burst + reading cycles
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
@@ -707,103 +756,7 @@ func TestEngine_ReadingPhase_BackgroundQueries(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	// After 8 seconds, we should have seen queries from both burst and reading phases
 	if len(queries) < 3 {
 		t.Errorf("expected at least 3 queries over 8s, got %d", len(queries))
-	}
-}
-
-func TestEngine_BurstPhase_CoverQueryError(t *testing.T) {
-	// Verify that a cover query error is logged but does not stop the burst
-	tunnelQueue := make(chan *crypto.Chunk, 10)
-
-	var mu sync.Mutex
-	var callCount int
-
-	e := newTestEngine(tunnelQueue, func(q string) error {
-		mu.Lock()
-		callCount++
-		mu.Unlock()
-		return fmt.Errorf("query send error")
-	}, func(ch *crypto.Chunk) error {
-		return nil
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	e.burstPhase(ctx)
-
-	mu.Lock()
-	defer mu.Unlock()
-	// Even with errors, multiple queries should have been attempted
-	if callCount == 0 {
-		t.Error("expected at least one query attempt")
-	}
-}
-
-func TestEngine_DrainTunnelChunks_ExactMax(t *testing.T) {
-	// Put exactly max chunks, verify all are drained
-	tunnelQueue := make(chan *crypto.Chunk, 10)
-	for i := 0; i < 3; i++ {
-		tunnelQueue <- makeChunk(uint32(i), uint64(i))
-	}
-
-	var drained int
-
-	e := newTestEngine(tunnelQueue, func(q string) error {
-		return nil
-	}, func(ch *crypto.Chunk) error {
-		drained++
-		return nil
-	})
-
-	ctx := context.Background()
-	e.drainTunnelChunks(ctx, 3)
-
-	if drained != 3 {
-		t.Errorf("drained = %d, want 3", drained)
-	}
-	if len(tunnelQueue) != 0 {
-		t.Errorf("queue len = %d, want 0", len(tunnelQueue))
-	}
-}
-
-func TestEngine_BurstPhase_InjectsTunnelMidBurst(t *testing.T) {
-	// Verify that tunnel chunks are injected during burst phase after every
-	// ratio.Current() cover queries
-	tunnelQueue := make(chan *crypto.Chunk, 10)
-	for i := 0; i < 5; i++ {
-		tunnelQueue <- makeChunk(uint32(i), uint64(i))
-	}
-
-	var mu sync.Mutex
-	var tunnelSent int
-	var querySent int
-
-	e := newTestEngine(tunnelQueue, func(q string) error {
-		mu.Lock()
-		querySent++
-		mu.Unlock()
-		return nil
-	}, func(ch *crypto.Chunk) error {
-		mu.Lock()
-		tunnelSent++
-		mu.Unlock()
-		return nil
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	e.burstPhase(ctx)
-
-	mu.Lock()
-	defer mu.Unlock()
-	if querySent == 0 {
-		t.Error("expected cover queries to be sent during burst")
-	}
-	if tunnelSent == 0 {
-		t.Error("expected tunnel chunks to be injected during burst")
 	}
 }

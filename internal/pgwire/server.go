@@ -333,6 +333,15 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	const connPID int32 = 12345
 
 	for {
+		// Flush any buffered responses before blocking for the next message.
+		// During pipelining, msgCh already has the next message queued (from
+		// the readNext goroutine), so the select below won't block and we skip
+		// this flush — responses accumulate until Sync. When the pipeline is
+		// drained, msgCh is empty and we flush here before blocking.
+		if bw.Buffered() > 0 {
+			bw.Flush()
+		}
+
 		select {
 		case <-ctx.Done():
 			return
@@ -384,7 +393,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 				} else {
 					WriteMessage(bw, MsgParseComplete, nil)
 				}
-				bw.Flush()
+				// No explicit flush — handled by flush-before-block at top of loop.
 
 			case MsgBind:
 				portal, stmt, params, err := ParseBind(msg.Payload)
@@ -403,7 +412,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 				} else {
 					WriteMessage(bw, MsgBindComplete, nil)
 				}
-				bw.Flush()
+				// No explicit flush — handled by flush-before-block at top of loop.
 
 			case MsgExecute:
 				portal := ""
@@ -423,11 +432,11 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 						s.sendResult(bw, result)
 					}
 				}
-				bw.Flush()
+				// No explicit flush — handled by flush-before-block at top of loop.
 
 			case MsgSync:
 				WriteMessage(bw, MsgReadyForQuery, BuildReadyForQuery(txStatus))
-				bw.Flush()
+				bw.Flush() // Sync always flushes immediately (protocol requirement).
 
 			case MsgDescribe:
 				if s.config.QueryHandler != nil && len(msg.Payload) > 0 {
@@ -447,11 +456,11 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 				} else {
 					WriteMessage(bw, MsgNoData, nil)
 				}
-				bw.Flush()
+				// No explicit flush — handled by flush-before-block at top of loop.
 
 			case MsgClose:
 				WriteMessage(bw, MsgCloseComplete, nil)
-				bw.Flush()
+				// No explicit flush — handled by flush-before-block at top of loop.
 
 			case MsgFlush:
 				bw.Flush()

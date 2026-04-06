@@ -160,7 +160,22 @@ func (s *Stream) Read(buf []byte) (int, error) {
 }
 
 // DeliverResponse delivers a response chunk from the relay.
+// Safe to call concurrently with Close — silently drops data
+// if the stream is already closed.
 func (s *Stream) DeliverResponse(ch *crypto.Chunk) {
+	s.mu.Lock()
+	closed := s.State == StateClosed
+	s.mu.Unlock()
+	if closed {
+		return
+	}
+
+	// FIN from remote — close the read side so Read() returns EOF.
+	if ch.Type == crypto.ChunkFIN {
+		s.cancel()
+		return
+	}
+
 	segments := s.assembler.Insert(ch.Sequence, ch.Payload)
 	for _, seg := range segments {
 		select {
@@ -206,7 +221,8 @@ func (s *Stream) Close() error {
 	s.mu.Unlock()
 
 	s.cancel()
-	close(s.inData)
+	// Do not close(s.inData) — cancel() unblocks Read() via ctx.Done(),
+	// and closing the channel races with DeliverResponse sends.
 	return nil
 }
 

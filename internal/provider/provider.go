@@ -28,4 +28,8 @@ type Provider interface {
 
 	// IsHealthy returns whether the provider connection is alive.
 	IsHealthy() bool
+
+	// FlushPipeline flushes any queued pipelined inserts.
+	// No-op for providers that don't support pipelining.
+	FlushPipeline() error
 }

@@ -62,6 +62,8 @@ func (m *mockProvider) IsHealthy() bool {
 	return m.healthy
 }
 
+func (m *mockProvider) FlushPipeline() error { return nil }
+
 func TestManager_AddAndSelect(t *testing.T) {
 	mgr := NewManager(nil)
 
@@ -493,6 +495,10 @@ func TestPgProvider_SendTunnelInsert_Connected(t *testing.T) {
 	if err := p.SendTunnelInsert(chunk, "session-abc", "px_token123"); err != nil {
 		t.Fatalf("SendTunnelInsert: %v", err)
 	}
+	// Flush pipelined insert so it reaches the server.
+	if err := p.FlushPipeline(); err != nil {
+		t.Fatalf("FlushPipeline: %v", err)
+	}
 
 	// Verify the handler received parse and bind
 	handler.mu.Lock()
@@ -719,6 +725,10 @@ func TestPgProvider_SendTunnelInsert_PrepareOnlyOnce(t *testing.T) {
 	}
 	if err := p.SendTunnelInsert(chunk, "s2", "px2"); err != nil {
 		t.Fatalf("second SendTunnelInsert: %v", err)
+	}
+	// Flush pipelined inserts so they reach the server.
+	if err := p.FlushPipeline(); err != nil {
+		t.Fatalf("FlushPipeline: %v", err)
 	}
 
 	handler.mu.Lock()

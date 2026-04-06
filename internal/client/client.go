@@ -25,7 +25,8 @@ import (
 type Client struct {
 	cfg           *config.ClientConfig
 	streamManager *tunnel.StreamManager
-	providerMgr   *provider.Manager
+	sendMgr       *provider.Manager // for tunnel INSERT + cover queries
+	pollMgr       *provider.Manager // separate connection for response polling
 	socks5        *proxy.SOCKS5Server
 	interleaveEng *interleave.Engine
 	cipher        *crypto.Cipher
@@ -66,16 +67,28 @@ func New(cfg *config.ClientConfig, logger *slog.Logger) (*Client, error) {
 	// Create stream manager
 	streamMgr := tunnel.NewStreamManager(cfg.Tunnel.ChunkSize, 1024)
 
-	// Create provider manager and register relay providers
-	providerMgr := provider.NewManager(nil)
+	// Create TWO provider managers: one for sending (tunnel + cover), one for polling.
+	// This prevents mutex contention on the single pgwire connection.
+	sendMgr := provider.NewManager(nil)
+	pollMgr := provider.NewManager(nil)
 	for _, relay := range cfg.Relays {
-		p := provider.NewPgProvider(provider.PgProviderConfig{
+		// Send connection
+		sendP := provider.NewPgProvider(provider.PgProviderConfig{
 			Address:  relay.Address,
 			Username: relay.Username,
 			Password: relay.Password,
 			Database: relay.Database,
 		})
-		providerMgr.Add(p, relay.Weight)
+		sendMgr.Add(sendP, relay.Weight)
+
+		// Poll connection (separate pgwire conn to same relay)
+		pollP := provider.NewPgProvider(provider.PgProviderConfig{
+			Address:  relay.Address,
+			Username: relay.Username,
+			Password: relay.Password,
+			Database: relay.Database,
+		})
+		pollMgr.Add(pollP, relay.Weight)
 	}
 
 	// Create real-query engine for cover traffic
@@ -94,19 +107,19 @@ func New(cfg *config.ClientConfig, logger *slog.Logger) (*Client, error) {
 		return nil, fmt.Errorf("create cipher: %w", err)
 	}
 
-	// Build interleaving engine config
+	// Build interleaving engine config — uses sendMgr only
 	interleaveCfg := interleave.Config{
 		QueryEngine: queryEngine,
 		TunnelQueue: streamMgr.OutQueue(),
 		SendQuery: func(query string) error {
-			p := providerMgr.Select()
+			p := sendMgr.Select()
 			if p == nil {
 				return fmt.Errorf("no healthy provider")
 			}
 			return p.SendQuery(query)
 		},
 		SendTunnel: func(chunk *crypto.Chunk) error {
-			p := providerMgr.Select()
+			p := sendMgr.Select()
 			if p == nil {
 				return fmt.Errorf("no healthy provider")
 			}
@@ -123,6 +136,14 @@ func New(cfg *config.ClientConfig, logger *slog.Logger) (*Client, error) {
 			}
 			return p.SendTunnelInsert(encChunk, sessionID, crypto.GenerateAuthToken(sharedSecret, sessionID))
 		},
+		FlushFunc: func() error {
+			p := sendMgr.Select()
+			if p == nil {
+				return nil
+			}
+			return p.FlushPipeline()
+		},
+		Logger: logger,
 	}
 	if cfg.Tunnel.BurstSpacingMs > 0 {
 		interleaveCfg.BurstSpacingOverride = time.Duration(cfg.Tunnel.BurstSpacingMs) * time.Millisecond
@@ -139,7 +160,8 @@ func New(cfg *config.ClientConfig, logger *slog.Logger) (*Client, error) {
 	return &Client{
 		cfg:           cfg,
 		streamManager: streamMgr,
-		providerMgr:   providerMgr,
+		sendMgr:       sendMgr,
+		pollMgr:       pollMgr,
 		socks5:        socks5,
 		interleaveEng: interleaveEng,
 		cipher:        tunnelCipher,
@@ -154,9 +176,12 @@ func New(cfg *config.ClientConfig, logger *slog.Logger) (*Client, error) {
 func (c *Client) Run(ctx context.Context) error {
 	c.logger.Info("client starting")
 
-	// Connect to all relay providers
-	if err := c.providerMgr.ConnectAll(ctx); err != nil {
-		return fmt.Errorf("connect relays: %w", err)
+	// Connect both provider managers (send + poll connections)
+	if err := c.sendMgr.ConnectAll(ctx); err != nil {
+		return fmt.Errorf("connect send relays: %w", err)
+	}
+	if err := c.pollMgr.ConnectAll(ctx); err != nil {
+		return fmt.Errorf("connect poll relays: %w", err)
 	}
 	c.logger.Info("connected to relays")
 
@@ -167,10 +192,10 @@ func (c *Client) Run(ctx context.Context) error {
 		}
 	}()
 
-	// Start response polling loop in background
+	// Start response polling loop in background (uses pollMgr — no contention)
 	go c.pollResponses(ctx)
 
-	c.logger.Info("client ready", "socks5", c.cfg.Proxy.Listen)
+	c.logger.Info("client ready", "socks5", c.cfg.Proxy.Listen, "session", c.sessionID)
 
 	// Run interleaving engine (blocks until ctx cancelled)
 	return c.interleaveEng.Run(ctx)
@@ -191,42 +216,66 @@ func (c *Client) SessionID() string {
 	return c.sessionID
 }
 
-// pollResponses periodically fetches response chunks from relays and delivers
-// them to the appropriate streams. This is the "poll" response mode.
+// pollResponses fetches response chunks from relays as fast as possible.
+// Uses pollMgr (separate pgwire connection) so it never blocks the send path.
 func (c *Client) pollResponses(ctx context.Context) {
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
+	const (
+		idleInterval = 5 * time.Millisecond // poll rate when no data
+		maxIdle      = 10                    // consecutive empty polls before slowing
+	)
 
+	idle := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			c.fetchAndDeliverResponses(ctx)
+		default:
+		}
+
+		n := c.fetchAndDeliverResponses(ctx)
+		if n > 0 {
+			// Data flowing — re-poll immediately, no sleep.
+			idle = 0
+			continue
+		}
+
+		// No data — back off gradually.
+		idle++
+		if idle >= maxIdle {
+			select {
+			case <-time.After(idleInterval):
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
 }
 
-func (c *Client) fetchAndDeliverResponses(ctx context.Context) {
-	p := c.providerMgr.Select()
+func (c *Client) fetchAndDeliverResponses(ctx context.Context) int {
+	// Uses pollMgr — separate connection from the interleave engine
+	p := c.pollMgr.Select()
 	if p == nil {
-		return
+		return 0
 	}
 
 	chunks, err := p.FetchResponses(c.sessionID)
 	if err != nil {
 		c.logger.Debug("fetch responses error", "err", err)
-		return
+		return 0
 	}
 
 	for _, ch := range chunks {
-		// Deliver response to the matching stream.
 		stream, ok := c.streamManager.GetStream(ch.StreamID)
 		if !ok {
 			continue
 		}
+		c.logger.Debug("response chunk received", "stream", ch.StreamID, "seq", ch.Sequence, "bytes", len(ch.Payload))
+		if c.interleaveEng != nil {
+			c.interleaveEng.Stats().RecordResponse(len(ch.Payload))
+		}
 		stream.DeliverResponse(ch)
 	}
+	return len(chunks)
 }
 
 // generateSessionID creates a UUID-like hex session identifier.

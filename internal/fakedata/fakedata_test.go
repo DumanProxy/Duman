@@ -965,8 +965,8 @@ func TestFetchResponses_WithChunks(t *testing.T) {
 	if len(result.Rows) != 3 {
 		t.Fatalf("rows = %d, want 3", len(result.Rows))
 	}
-	if len(result.Columns) != 3 {
-		t.Errorf("columns = %d, want 3", len(result.Columns))
+	if len(result.Columns) != 4 {
+		t.Errorf("columns = %d, want 4", len(result.Columns))
 	}
 	// Check column OIDs
 	if result.Columns[0].OID != pgwire.OIDBytea {
@@ -977,6 +977,9 @@ func TestFetchResponses_WithChunks(t *testing.T) {
 	}
 	if result.Columns[2].OID != pgwire.OIDInt4 {
 		t.Errorf("col[2].OID = %d, want OIDInt4", result.Columns[2].OID)
+	}
+	if result.Columns[3].OID != pgwire.OIDInt4 {
+		t.Errorf("col[3].OID = %d, want OIDInt4 (chunk_type)", result.Columns[3].OID)
 	}
 	// Check first row data
 	if string(result.Rows[0][0]) != "data0" {

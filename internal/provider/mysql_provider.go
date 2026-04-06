@@ -114,7 +114,7 @@ func (p *MysqlProvider) FetchResponses(sessionID string) ([]*crypto.Chunk, error
 		return nil, fmt.Errorf("not connected")
 	}
 
-	query := fmt.Sprintf("SELECT payload, seq, stream_id FROM analytics_responses WHERE session_id = '%s' AND consumed = FALSE ORDER BY seq ASC LIMIT 50", sessionID)
+	query := fmt.Sprintf("SELECT payload, seq, stream_id, chunk_type FROM analytics_responses WHERE session_id = '%s' AND consumed = FALSE ORDER BY seq ASC LIMIT 500", sessionID)
 	result, err := p.client.SimpleQuery(query)
 	if err != nil {
 		return nil, err
@@ -129,9 +129,19 @@ func (p *MysqlProvider) FetchResponses(sessionID string) ([]*crypto.Chunk, error
 		if err != nil {
 			payload = row[0]
 		}
+		var seq uint64
+		var streamID uint32
+		var chunkType int
+		fmt.Sscanf(string(row[1]), "%d", &seq)
+		fmt.Sscanf(string(row[2]), "%d", &streamID)
+		if len(row) >= 4 && row[3] != nil {
+			fmt.Sscanf(string(row[3]), "%d", &chunkType)
+		}
 		ch := &crypto.Chunk{
-			Type:    crypto.ChunkData,
-			Payload: payload,
+			Type:     crypto.ChunkType(chunkType),
+			Payload:  payload,
+			Sequence: seq,
+			StreamID: streamID,
 		}
 		chunks = append(chunks, ch)
 	}
@@ -159,6 +169,8 @@ func (p *MysqlProvider) IsHealthy() bool {
 	defer p.mu.Unlock()
 	return p.healthy
 }
+
+func (p *MysqlProvider) FlushPipeline() error { return nil }
 
 func mysqlChunkTypeToEventType(ct crypto.ChunkType) string {
 	switch ct {

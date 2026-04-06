@@ -66,3 +66,5 @@ func (p *RestProvider) Type() string {
 func (p *RestProvider) IsHealthy() bool {
 	return p.healthy
 }
+
+func (p *RestProvider) FlushPipeline() error { return nil }

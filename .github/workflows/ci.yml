@@ -3,8 +3,12 @@ name: CI
 on:
   push:
     branches: [main, develop]
+    tags: ['v*']
   pull_request:
     branches: [main]
+
+permissions:
+  contents: write
 
 jobs:
   test:
@@ -16,9 +20,9 @@ jobs:
         go-version: ['1.23']
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go-version }}
 
@@ -32,24 +36,12 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: go test ./... -race -count=1 -short -timeout 15m
 
-  bench:
-    name: Benchmark
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
-        with:
-          go-version: '1.23'
-
-      - name: Run benchmarks
-        run: go test ./internal/crypto/... -bench=. -benchmem -count=1
-
   lint:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.23'
 
@@ -57,41 +49,60 @@ jobs:
         run: go vet ./...
 
   release:
-    name: Release Build
+    name: Release
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [test, lint]
-    strategy:
-      matrix:
-        include:
-          - goos: linux
-            goarch: amd64
-          - goos: linux
-            goarch: arm64
-          - goos: darwin
-            goarch: amd64
-          - goos: darwin
-            goarch: arm64
-          - goos: windows
-            goarch: amd64
 
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.23'
 
-      - name: Build
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
+      - name: Build all platforms
         run: |
           mkdir -p dist
-          go build -o dist/duman-client-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }} ./cmd/duman-client/
-          go build -o dist/duman-relay-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }} ./cmd/duman-relay/
+          platforms=(
+            "linux/amd64"
+            "linux/arm64"
+            "darwin/amd64"
+            "darwin/arm64"
+            "windows/amd64"
+          )
+          for platform in "${platforms[@]}"; do
+            IFS='/' read -r GOOS GOARCH <<< "$platform"
+            ext=""
+            if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v5
+            echo "Building $GOOS/$GOARCH..."
+            GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w" \
+              -o "dist/duman-client-${GOOS}-${GOARCH}${ext}" ./cmd/duman-client/
+            GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="-s -w" \
+              -o "dist/duman-relay-${GOOS}-${GOARCH}${ext}" ./cmd/duman-relay/
+          done
+
+      - name: Copy config examples
+        run: |
+          cp dist/client.yaml dist/client.example.yaml 2>/dev/null || true
+          cp dist/server.yaml dist/server.example.yaml 2>/dev/null || true
+          cp configs/*.yaml dist/ 2>/dev/null || true
+
+      - name: Create checksums
+        run: |
+          cd dist
+          sha256sum duman-* > checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          files: |
+            dist/duman-client-*
+            dist/duman-relay-*
+            dist/checksums.txt

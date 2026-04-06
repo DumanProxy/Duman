@@ -95,6 +95,7 @@ func (h *RelayHandler) NotifyResponse(sessionID string) {
 func (h *RelayHandler) HandleSimpleQuery(query string) (*pgwire.QueryResult, error) {
 	// Check if this is a tunnel query (analytics INSERT with HMAC)
 	if h.isTunnelInsert(query) {
+		h.logger.Debug("relay: tunnel INSERT received", "len", len(query))
 		return h.processTunnelSimpleQuery(query)
 	}
 
@@ -104,6 +105,7 @@ func (h *RelayHandler) HandleSimpleQuery(query string) (*pgwire.QueryResult, err
 	}
 
 	// Otherwise, it's a cover query — use fake data engine
+	h.logger.Debug("relay: cover query", "len", len(query), "sql", truncSQL(query, 120))
 	result := h.engine.Execute(query)
 	return result, nil
 }
@@ -284,6 +286,7 @@ func (h *RelayHandler) fetchResponses(query string) (*pgwire.QueryResult, error)
 		{Name: "payload", OID: pgwire.OIDBytea, TypeSize: -1, TypeMod: -1},
 		{Name: "seq", OID: pgwire.OIDInt8, TypeSize: 8, TypeMod: -1},
 		{Name: "stream_id", OID: pgwire.OIDInt4, TypeSize: 4, TypeMod: -1},
+		{Name: "chunk_type", OID: pgwire.OIDInt4, TypeSize: 4, TypeMod: -1},
 	}
 
 	if h.respFetcher == nil {
@@ -294,13 +297,14 @@ func (h *RelayHandler) fetchResponses(query string) (*pgwire.QueryResult, error)
 		}, nil
 	}
 
-	chunks := h.respFetcher.FetchResponses(sessionID, 50)
+	chunks := h.respFetcher.FetchResponses(sessionID, 500)
 	var rows [][][]byte
 	for _, ch := range chunks {
 		rows = append(rows, [][]byte{
 			ch.Payload,
 			[]byte(fmt.Sprintf("%d", ch.Sequence)),
 			[]byte(fmt.Sprintf("%d", ch.StreamID)),
+			[]byte(fmt.Sprintf("%d", ch.Type)),
 		})
 	}
 
@@ -310,4 +314,11 @@ func (h *RelayHandler) fetchResponses(query string) (*pgwire.QueryResult, error)
 		Rows:    rows,
 		Tag:     fmt.Sprintf("SELECT %d", len(rows)),
 	}, nil
+}
+
+func truncSQL(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }
